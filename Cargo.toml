@@ -1,0 +1,45 @@
+[package]
+name = "JITserver"
+version = "1.0.0"
+edition = "2024"
+license = "AGPL-3.0"
+
+[dependencies]
+anyhow = "1"
+eframe = { version = "0.33.3", default-features = false, features = [
+  "default_fonts",
+  "accesskit",
+  "wgpu",
+  "glow",
+  "wayland",
+  "x11",
+] }
+egui = "0.33.3"
+idevice = { version = "=0.1.59", features = [
+  "core_device",
+  "core_device_proxy",
+  "debug_proxy",
+  "dvt",
+  "installation_proxy",
+  "mobile_image_mounter",
+  "rsd",
+  "tss",
+  "tunnel_tcp_stack",
+  "usbmuxd",
+] }
+naga = { version = "27", features = ["termcolor"] }
+plist = "1.8"
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+rquickjs = "0.9"
+tokio = { version = "1.45", features = ["full"] }
+uuid = { version = "1.18", features = ["serde", "v4"] }
+wgpu = { version = "27", features = ["dx12", "vulkan", "metal", "gles"] }
+
+[build-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Com"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1.12"
