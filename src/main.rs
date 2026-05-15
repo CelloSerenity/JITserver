@@ -10,7 +10,8 @@ use std::{
 };
 
 use device::{
-    AppInfo, CheckStatus, DeviceInfo, DeviceStatus, ProcessInfo, WorkerCommand, WorkerEvent,
+    AppInfo, CheckStatus, DeviceInfo, DeviceStatus, ProcessInfo, RequiresScriptsStatus,
+    WorkerCommand, WorkerEvent,
 };
 use eframe::egui;
 use rfd::FileDialog;
@@ -20,6 +21,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1120.0, 760.0]),
         ..Default::default()
     };
+
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    {
+        options.renderer = eframe::Renderer::Glow;
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -128,7 +134,7 @@ impl DebuggerApp {
                         self.selected_device = previous_udid.as_ref().and_then(|udid| {
                             self.devices.iter().position(|device| &device.udid == udid)
                         });
-                        if self.selected_device.is_none() && !self.devices.is_empty() {
+                        if self.selected_device.is_none() && self.devices.len() == 1 {
                             self.select_device(0);
                         }
                     }
@@ -437,6 +443,7 @@ impl DebuggerApp {
 
     fn select_device(&mut self, index: usize) {
         self.selected_device = Some(index);
+        self.logs.clear();
         self.apps.clear();
         self.processes.clear();
         self.selected_app = None;
@@ -531,11 +538,11 @@ impl DebuggerApp {
 }
 
 impl eframe::App for DebuggerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.maybe_refresh_processes();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             let devices_height = 180.0;
             let log_height = 180.0;
             let top_spacing = 8.0;
@@ -917,60 +924,119 @@ impl eframe::App for DebuggerApp {
                 });
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
 fn device_label(device: &DeviceInfo) -> String {
-    if device.product_version.is_empty() {
-        format!("{} ({})", device.name, device.connection)
-    } else {
-        format!(
-            "{} OS {} ({})",
-            device.name, device.product_version, device.connection
-        )
-    }
+    format!("{} ({})", device.name, device.connection)
 }
 
 fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>) {
     match status {
         Ok(status) => {
-            ui.label(format!(
-                "Wireless Debugging: {}",
-                format_check_status(&status.wireless_debugging)
-            ));
-            ui.label(format!(
-                "Developer Mode: {}",
-                format_check_status(&status.developer_mode)
-            ));
-            ui.label(format!(
-                "Developer Disk Image: {}",
-                format_check_status(&status.developer_disk_image)
-            ));
+            ui.horizontal(|ui| {
+                ui.label("Wireless Debugging:");
+                match &status.wireless_debugging {
+                    CheckStatus::Success => {
+                        ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
+                    }
+                    CheckStatus::Disabled => {
+                        ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
+                    }
+                    CheckStatus::Failed(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
+                        );
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Developer Mode:");
+                match &status.developer_mode {
+                    CheckStatus::Success => {
+                        ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
+                    }
+                    CheckStatus::Disabled => {
+                        ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
+                    }
+                    CheckStatus::Failed(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
+                        );
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Developer Disk Image:");
+                match &status.developer_disk_image {
+                    CheckStatus::Success => {
+                        ui.label(egui::RichText::new("Mounted").color(egui::Color32::from_rgb(80, 200, 80)));
+                    }
+                    CheckStatus::Disabled => {
+                        ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
+                    }
+                    CheckStatus::Failed(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
+                        );
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Requires Scripts:");
+                match &status.requires_scripts {
+                    RequiresScriptsStatus::Yes => {
+                        ui.label(
+                            egui::RichText::new("Yes (TXM device on iOS 26+)")
+                                .color(egui::Color32::from_rgb(80, 200, 80)),
+                        );
+                    }
+                    RequiresScriptsStatus::No(reason) => {
+                        ui.label(
+                            egui::RichText::new(format!("No ({reason})"))
+                                .color(egui::Color32::from_rgb(80, 200, 80)),
+                        );
+                    }
+                    RequiresScriptsStatus::Unknown(e) => {
+                        ui.label(
+                            egui::RichText::new(format!("Unknown: {e}"))
+                                .color(egui::Color32::RED),
+                        );
+                    }
+                }
+            });
         }
         Err(error) => {
-            ui.label(format!("Wireless Debugging: Failed: {error}"));
-            ui.label(format!("Developer Mode: Failed: {error}"));
-            ui.label(format!("Developer Disk Image: Failed: {error}"));
+            ui.horizontal(|ui| {
+                ui.label("Wireless Debugging:");
+                ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Developer Mode:");
+                ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Developer Disk Image:");
+                ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Requires Scripts:");
+                ui.label(
+                    egui::RichText::new(format!("Unknown: {error}"))
+                        .color(egui::Color32::RED),
+                );
+            });
         }
     }
 }
 
-fn format_check_status(status: &CheckStatus) -> String {
-    match status {
-        CheckStatus::Success => "Success".to_string(),
-        CheckStatus::Failed(error) => format!("Failed: {error}"),
-    }
-}
 
 const BUNDLED_SCRIPTS: [(&str, &str); 4] = [
     ("Geode.js", include_str!("../scripts/Geode.js")),
     ("maciOS.js", include_str!("../scripts/maciOS.js")),
     ("universal.js", include_str!("../scripts/universal.js")),
-    (
-        "UTM-DolphiniOS-Flycast.js",
-        include_str!("../scripts/UTM-DolphiniOS-Flycast.js"),
-    ),
+    ("Alternate.js", include_str!("../scripts/Alternate.js")),
 ];
 
 fn read_script_entries(dir: &Path) -> std::io::Result<Vec<ScriptEntry>> {
@@ -1021,15 +1087,16 @@ fn custom_scripts_dir() -> PathBuf {
 }
 
 fn format_device_refresh_error(error: &str) -> String {
+    #[allow(unused_mut)]
     let mut message = error.to_string();
-    if error.contains("device socket io failed") && error.contains("os error 10061") {
+    if error.contains("device socket io failed") {
         #[cfg(target_os = "windows")]
         {
-            message.push_str(" Make sure you have Apple Devices/iTunes installed.");
+            message.push_str(". Make sure you have Apple Devices/iTunes installed and that you have accepted Apple's Terms of Service.");
         }
         #[cfg(target_os = "linux")]
         {
-            message.push_str(" Make sure you have usbmuxd installed.");
+            message.push_str(". Make sure you have usbmuxd installed and running.");
         }
     }
     message
@@ -1068,7 +1135,7 @@ fn app_support_dir() -> PathBuf {
 fn is_built_in_script_name(name: &str) -> bool {
     matches!(
         script_name_key(name).as_str(),
-        "geode" | "macios" | "universal" | "utmdolphiniosflycast"
+        "geode" | "macios" | "universal" | "alternate"
     )
 }
 
@@ -1087,15 +1154,15 @@ const DEFAULT_SCRIPT_NAME: &str = "universal.js";
 const MACIOS_SCRIPT_NAME: &str = "maciOS.js";
 const GEODE_SCRIPT_NAME: &str = "Geode.js";
 const UNIVERSAL_SCRIPT_NAME: &str = "universal.js";
-const UTM_SCRIPT_NAME: &str = "UTM-DolphiniOS-Flycast.js";
+const UTM_SCRIPT_NAME: &str = "Alternate.js";
 
 fn recommended_script_for_target(target_name: &str) -> Option<&'static str> {
     let key = script_name_key(target_name);
     match key.as_str() {
         "macios" => Some(MACIOS_SCRIPT_NAME),
-        "amethyst" | "melonx" | "xenios" | "melocafe" | "manic emu" => Some(UNIVERSAL_SCRIPT_NAME),
+        "amethyst" | "melonx" | "xenios" | "melocafe" | "manic emu" | "dukex" => Some(UNIVERSAL_SCRIPT_NAME),
         "geode" => Some(GEODE_SCRIPT_NAME),
-        "utm" | "dolphinios" | "flycast" => Some(UTM_SCRIPT_NAME),
+        "utm" | "dolphinios" | "flycast" | "armsx2ios" => Some(UTM_SCRIPT_NAME),
         _ => None,
     }
 }

@@ -1,12 +1,12 @@
 [package]
 name = "JITserver"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "AGPL-3.0"
 
 [dependencies]
 anyhow = "1"
-eframe = { version = "0.33.3", default-features = false, features = [
+eframe = { version = "0.34.3", default-features = false, features = [
   "default_fonts",
   "accesskit",
   "wgpu",
@@ -14,8 +14,8 @@ eframe = { version = "0.33.3", default-features = false, features = [
   "wayland",
   "x11",
 ] }
-egui = "0.33.3"
-idevice = { version = "=0.1.59", features = [
+egui = "0.34.3"
+idevice = { version = "0.1.61", features = [
   "core_device",
   "core_device_proxy",
   "debug_proxy",
@@ -27,16 +27,15 @@ idevice = { version = "=0.1.59", features = [
   "tunnel_tcp_stack",
   "usbmuxd",
 ] }
-naga = { version = "27", features = ["termcolor"] }
-plist = "1.8"
-rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
-rquickjs = "0.9"
-tokio = { version = "1.45", features = ["full"] }
-uuid = { version = "1.18", features = ["serde", "v4"] }
-wgpu = { version = "27", features = ["dx12", "vulkan", "metal", "gles"] }
+naga = { version = "29", features = ["termcolor"] }
+plist = "1.9"
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+rquickjs = "0.12"
+tokio = { version = "1.52", features = ["full"] }
+uuid = { version = "1.23", features = ["serde", "v4"] }
 
 [build-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Com"] }

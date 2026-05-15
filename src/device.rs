@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use idevice::{
-    IdeviceService, ReadWrite, RsdService,
+    IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::AppServiceClient,
     core_device_proxy::CoreDeviceProxy,
     debug_proxy::{DebugProxyClient, DebugserverCommand},
@@ -25,7 +25,7 @@ use tokio::{runtime::Runtime, sync::Mutex};
 
 use crate::scripts;
 
-const LABEL: &str = "idevice_debugger_gui";
+const LABEL: &str = "JITserver";
 
 mod embedded_ddi {
     include!(concat!(env!("OUT_DIR"), "/ddi_bundle.rs"));
@@ -35,7 +35,6 @@ mod embedded_ddi {
 pub struct DeviceInfo {
     pub udid: String,
     pub name: String,
-    pub product_version: String,
     pub connection: String,
 }
 
@@ -51,16 +50,31 @@ pub struct ProcessInfo {
     pub name: String,
 }
 
+#[derive(Clone, Debug)]
+pub enum RequiresScriptsStatus {
+    Yes,
+    No(String),
+    Unknown(String),
+}
+
+impl Default for RequiresScriptsStatus {
+    fn default() -> Self {
+        Self::Unknown("Not checked yet".to_string())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DeviceStatus {
     pub wireless_debugging: CheckStatus,
     pub developer_mode: CheckStatus,
     pub developer_disk_image: CheckStatus,
+    pub requires_scripts: RequiresScriptsStatus,
 }
 
 #[derive(Clone, Debug)]
 pub enum CheckStatus {
     Success,
+    Disabled,
     Failed(String),
 }
 
@@ -319,32 +333,24 @@ async fn refresh_devices() -> Result<Vec<DeviceInfo>> {
 
     for device in devices {
         let provider = device.to_provider(UsbmuxdAddr::default(), LABEL);
-        let (name, product_version) = match LockdownClient::connect(&provider).await {
+        let name = match LockdownClient::connect(&provider).await {
             Ok(mut lockdown) => {
                 if let Ok(pairing_file) = provider.get_pairing_file().await {
                     let _ = lockdown.start_session(&pairing_file).await;
                 }
-                let name = lockdown
+                lockdown
                     .get_value(Some("DeviceName"), None)
                     .await
                     .ok()
                     .and_then(|value| value.as_string().map(ToOwned::to_owned))
-                    .unwrap_or_else(|| "Apple Device".to_string());
-                let product_version = lockdown
-                    .get_value(Some("ProductVersion"), None)
-                    .await
-                    .ok()
-                    .and_then(|value| value.as_string().map(ToOwned::to_owned))
-                    .unwrap_or_default();
-                (name, product_version)
+                    .unwrap_or_else(|| "Apple Device".to_string())
             }
-            Err(_) => ("Apple Device".to_string(), String::new()),
+            Err(_) => "Apple Device".to_string(),
         };
 
         infos.push(DeviceInfo {
             udid: device.udid,
             name,
-            product_version,
             connection: connection_label(&device.connection_type),
         });
     }
@@ -390,16 +396,93 @@ async fn inspect_device_status(udid: &str) -> DeviceStatus {
             return DeviceStatus {
                 wireless_debugging: CheckStatus::Failed(error.clone()),
                 developer_mode: CheckStatus::Failed(error.clone()),
-                developer_disk_image: CheckStatus::Failed(error),
+                developer_disk_image: CheckStatus::Failed(error.clone()),
+                requires_scripts: RequiresScriptsStatus::Unknown(error),
             };
         }
     };
 
     DeviceStatus {
         wireless_debugging: check_status(enable_wireless_debugging(&provider).await),
-        developer_mode: check_status(query_developer_mode(&provider).await),
+        developer_mode: match query_developer_mode(&provider).await {
+            Ok(true) => CheckStatus::Success,
+            Ok(false) => CheckStatus::Disabled,
+            Err(error) => CheckStatus::Failed(format_error(error)),
+        },
         developer_disk_image: check_status(ensure_developer_disk_image(&provider).await),
+        requires_scripts: match check_requires_scripts(&provider).await {
+            Ok((true, true)) => RequiresScriptsStatus::Yes,
+            Ok((has_txm, is_ios_26)) => {
+                let mut reasons = Vec::new();
+                if !has_txm {
+                    reasons.push("No TXM Detected");
+                }
+                if !is_ios_26 {
+                    reasons.push("Not Running iOS 26+");
+                }
+                RequiresScriptsStatus::No(reasons.join(", "))
+            }
+            Err(error) => RequiresScriptsStatus::Unknown(format_error(error)),
+        },
     }
+}
+
+fn has_txm_hardware(product_type: &str) -> bool {
+    let num_start = match product_type.find(|c: char| c.is_ascii_digit()) {
+        Some(i) => i,
+        None => return false,
+    };
+    let prefix = product_type[..num_start].to_lowercase();
+    let nums = &product_type[num_start..];
+    let (major_str, rest) = match nums.split_once(',') {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let minor_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let major: u32 = match major_str.parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let minor: u32 = match minor_str.parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match prefix.as_str() {
+        // A15 Bionic = iPhone14,2 (iPhone 13 Pro); anything higher also has TXM
+        "iphone" => major > 14 || (major == 14 && minor >= 2),
+        // M2 iPad = iPad14,5; anything higher also has TXM
+        "ipad" => major > 14 || (major == 14 && minor >= 5),
+        _ => false,
+    }
+}
+
+fn is_ios_26_or_newer(product_version: &str) -> bool {
+    product_version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|major| major >= 26)
+        .unwrap_or(false)
+}
+
+async fn check_requires_scripts(provider: &UsbmuxdProvider) -> Result<(bool, bool)> {
+    let mut lockdown = LockdownClient::connect(provider).await?;
+    if let Ok(pairing_file) = provider.get_pairing_file().await {
+        let _ = lockdown.start_session(&pairing_file).await;
+    }
+    let product_type = lockdown
+        .get_value(Some("ProductType"), None)
+        .await?
+        .as_string()
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    let product_version = lockdown
+        .get_value(Some("ProductVersion"), None)
+        .await?
+        .as_string()
+        .map(ToOwned::to_owned)
+        .unwrap_or_default();
+    Ok((has_txm_hardware(&product_type), is_ios_26_or_newer(&product_version)))
 }
 
 async fn enable_wireless_debugging(provider: &UsbmuxdProvider) -> Result<bool> {
@@ -424,8 +507,12 @@ async fn query_developer_mode(provider: &UsbmuxdProvider) -> Result<bool> {
 
 async fn ensure_developer_disk_image(provider: &UsbmuxdProvider) -> Result<bool> {
     let mut mounter = ImageMounter::connect(provider).await?;
-    if !mounter.copy_devices().await?.is_empty() {
-        return Ok(true);
+    match mounter.copy_devices().await {
+        Ok(devices) if !devices.is_empty() => return Ok(true),
+        // iOS 17+ uses CoreDevice and doesn't expose DDI via ImageMounter
+        Err(IdeviceError::GetProhibited) => return Ok(true),
+        Ok(_) => {}
+        Err(e) => return Err(e.into()),
     }
 
     let ddi = load_ddi_bundle()?;
