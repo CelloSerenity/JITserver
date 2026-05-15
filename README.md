@@ -1,4 +1,4 @@
-# JITserver
+# <img height="35" src="/Linux.png" alt="Logo"> JITserver
 
 A cross-platform GUI application that enables JIT for iOS devices.
 
