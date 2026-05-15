@@ -5,7 +5,7 @@ A cross-platform GUI application that enables JIT for iOS devices.
 ## Features
 
 - **Device Management**: Automatically discover and connect to iOS devices via USB
-- **JIT Enabling**: Self-explanatory.
+- **JIT Enabling**: Exposing developer mode, mounting Developer Disk Image, attaching debugger, and running scripts (iOS 26 TXM)
 - **App Integration**: Support to enable JIT for popular apps (even on iOS 26+) including:
   - Amethyst
   - MeloNX
@@ -15,54 +15,18 @@ A cross-platform GUI application that enables JIT for iOS devices.
   - UTM
   - DolphiniOS
   - Flycast-iOS 26 fork
-- **Developer Mode**: Monitor developer mode status
-- **Run Scripts**: Run Scripts required for JIT on TXM devices on iOS 26+
-  - Built-in scripts are bundled into the app for release builds
-  - Imported custom scripts are stored in the user's app data directory
-- **Developer Disk Image Mounting**: Automatically mount required developer images for iOS 17+
 
-## Prerequisites
+## Install/Build Prerequisites
 
-- **macOS/Linux/Windows**: Cross-platform support, must have usbmuxd installed
+- **macOS/Linux/Windows**: Must have usbmuxd installed
 - **iOS/iPadOS Device**: Must have a passcode set and be connected via USB
 - **Rust**: Required for building from source
 
-## Building from Source
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/CelloSerenity/JITserver
-   cd JITserver
-   ```
 
-2. Build the application:
-   ```bash
-   cargo build --release
-   ```
 
-3. Run the application:
-   ```bash
-   cargo run --release
-   ```
 
 ## Usage
-
-### Getting Started
-
-1. **Connect your iOS device** via USB to your computer, or over Local Network if on the same Wi-Fi and previously connected
-2. **Launch the application** - it will automatically scan for connected devices
-3. **Select your device** from the dropdown menu if not already selected
-
-
-## Install Guide
-
-### Prerequisites for JIT enabling
-
-Before enabling JIT, make sure you have:
-
-1. **Sideloaded an app** (can be done with [SideStore](https://sidestore.io/) or a certificate + signer)
-
-2. **Enabled Developer Mode** on your iOS/iPadOS device (found in Settings → Privacy & Security after sideloading an app, required for iOS 17+)
 
 ### Installation Instructions
 
@@ -84,11 +48,43 @@ Before enabling JIT, make sure you have:
    - [AArch64](https://github.com/CelloSerenity/JITserver/releases/latest/download/JITserver-linux-aarch64.AppImage)
 3. Make the downloaded file executable
 
-### Enabling JIT Instructions
+### Prerequisites for JIT
+
+Before enabling JIT, make sure you have:
+
+1. **Sideloaded an app** (can be done with [SideStore](https://sidestore.io/) or a developer **(NOT ENTERPRISE)** certificate + signer)
+2. **Enabled Developer Mode** on your iOS/iPadOS device (found in Settings → Privacy & Security after sideloading an app, required for iOS 17+)
+
+### App Setup
+
+1. **Connect your iOS device** via USB to your computer, or over Local Network if on the same Wi-Fi and previously connected
+2. **Launch the application** - it will automatically scan for connected devices
+3. **Select your device** from the dropdown menu if not already selected
+
+### Enabling JIT
 
 1. **Open JITserver** and select your device from the dropdown menu
 2. **Connect your device** to your computer via USB cable if it doesn't already appear
    - If prompted, select `Trust` and enter your passcode
+
+
+## Building from Source
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/CelloSerenity/JITserver
+   cd JITserver
+   ```
+
+2. Build the application:
+   ```bash
+   cargo build --release
+   ```
+
+3. Run the application:
+   ```bash
+   cargo run --release
+   ```
 
 ## Dependencies
 
