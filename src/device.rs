@@ -427,7 +427,12 @@ async fn inspect_device_status(udid: &str) -> DeviceStatus {
     }
 }
 
-fn has_txm_hardware(product_type: &str) -> bool {
+fn has_txm_hardware(product_type: &str, is_ios_27_or_newer: bool) -> bool {
+    // On iOS 27+, every device has TXM except these two non-TXM iPad models.
+    if is_ios_27_or_newer {
+        return product_type != "iPad8,11" && product_type != "iPad8,12";
+    }
+
     let num_start = match product_type.find(|c: char| c.is_ascii_digit()) {
         Some(i) => i,
         None => return false,
@@ -456,13 +461,16 @@ fn has_txm_hardware(product_type: &str) -> bool {
     }
 }
 
+fn ios_major_version(product_version: &str) -> Option<u32> {
+    product_version.split('.').next().and_then(|s| s.parse::<u32>().ok())
+}
+
 fn is_ios_26_or_newer(product_version: &str) -> bool {
-    product_version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-        .map(|major| major >= 26)
-        .unwrap_or(false)
+    ios_major_version(product_version).is_some_and(|major| major >= 26)
+}
+
+fn is_ios_27_or_newer(product_version: &str) -> bool {
+    ios_major_version(product_version).is_some_and(|major| major >= 27)
 }
 
 async fn check_requires_scripts(provider: &UsbmuxdProvider) -> Result<(bool, bool)> {
@@ -482,7 +490,8 @@ async fn check_requires_scripts(provider: &UsbmuxdProvider) -> Result<(bool, boo
         .as_string()
         .map(ToOwned::to_owned)
         .unwrap_or_default();
-    Ok((has_txm_hardware(&product_type), is_ios_26_or_newer(&product_version)))
+    let has_txm = has_txm_hardware(&product_type, is_ios_27_or_newer(&product_version));
+    Ok((has_txm, is_ios_26_or_newer(&product_version)))
 }
 
 async fn enable_wireless_debugging(provider: &UsbmuxdProvider) -> Result<bool> {
