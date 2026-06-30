@@ -116,7 +116,7 @@ Contributions are welcome! Please feel free to submit issues, feature requests, 
 
 ## License
 
-This project is licensed under the AGPL-3.0 License.
+This project is licensed under the AGPL-3.0 License for non-commercial use. If you wish to use this code commercially, you must obtain a written and explicit license from CelloSerenity.
 
 ## Acknowledgments
 
