@@ -14,6 +14,8 @@ Universal script:
   - MeloCafé
   - Manic EMU
   - DukeX
+  - AppleSauce
+  - RPCS3
   
 Alternate:
   - UTM

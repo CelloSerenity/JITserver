@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "JITserver"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1958,9 +1958,9 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "idevice"
-version = "0.1.61"
+version = "0.1.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab414e99190ac3dcd39587a210c1799ec3f8ef5943d132024108409bfa6976ab"
+checksum = "f5d7799c8497cef60ddfd38f7d92e267b9fa5d0b18e7691d31041453007400ca"
 dependencies = [
  "async-stream",
  "async_zip",
@@ -1973,7 +1973,6 @@ dependencies = [
  "plist",
  "plist-macro",
  "rand 0.10.1",
- "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -1983,6 +1982,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2056,9 +2056,9 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jktcp"
-version = "0.1.5"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d8c094fb3ffeaa1c4b94d176c6fd6d615433c9d25e0e5a52f56b96635e4d246"
+checksum = "4d3b9e59938be47d261173086c65a9352fe048951bc502109e7595b70b60cd98"
 dependencies = [
  "futures",
  "getrandom 0.3.4",
@@ -3352,8 +3352,6 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
- "serde",
- "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4722,6 +4720,15 @@ name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

@@ -15,9 +15,10 @@ eframe = { version = "0.34.3", default-features = false, features = [
   "x11",
 ] }
 egui = "0.34.3"
-idevice = { version = "0.1.61", features = [
+idevice = { version = "0.1.68", features = [
   "core_device",
   "core_device_proxy",
+  "cryptexd",
   "debug_proxy",
   "dvt",
   "installation_proxy",

@@ -12,6 +12,7 @@ use idevice::{
     IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::AppServiceClient,
     core_device_proxy::CoreDeviceProxy,
+    cryptexd::{Cryptex1Assets, install_ddi, installed_ddi},
     debug_proxy::{DebugProxyClient, DebugserverCommand},
     installation_proxy::InstallationProxyClient,
     mobile_image_mounter::ImageMounter,
@@ -515,48 +516,34 @@ async fn query_developer_mode(provider: &UsbmuxdProvider) -> Result<bool> {
 }
 
 async fn ensure_developer_disk_image(provider: &UsbmuxdProvider) -> Result<bool> {
+    let (mut adapter, mut handshake) = connect_rsd(provider).await?;
+    if installed_ddi(&mut adapter, &mut handshake).await?.is_some() {
+        return Ok(true);
+    }
+
     let mut mounter = ImageMounter::connect(provider).await?;
     match mounter.copy_devices().await {
         Ok(devices) if !devices.is_empty() => return Ok(true),
-        // iOS 17+ uses CoreDevice and doesn't expose DDI via ImageMounter
-        Err(IdeviceError::GetProhibited) => return Ok(true),
+        Err(IdeviceError::GetProhibited) => {}
         Ok(_) => {}
         Err(e) => return Err(e.into()),
     }
 
     let ddi = load_ddi_bundle()?;
-    let mut lockdown = LockdownClient::connect(provider).await?;
-    let unique_chip_id = lockdown
-        .get_value(Some("UniqueChipID"), None)
-        .await?
-        .as_unsigned_integer()
-        .context("missing UniqueChipID in lockdown response")?;
-
-    mounter
-        .mount_personalized(
-            provider,
-            ddi.image,
-            ddi.trust_cache,
-            &ddi.build_manifest,
-            None,
-            unique_chip_id,
-        )
-        .await?;
+    install_ddi(&mut adapter, &mut handshake, &ddi).await?;
     Ok(true)
 }
 
-struct DdiBundle {
-    build_manifest: Vec<u8>,
-    image: Vec<u8>,
-    trust_cache: Vec<u8>,
-}
-
-fn load_ddi_bundle() -> Result<DdiBundle> {
-    Ok(DdiBundle {
-        build_manifest: embedded_ddi::BUILD_MANIFEST.to_vec(),
-        image: embedded_ddi::IMAGE_DMG.to_vec(),
-        trust_cache: embedded_ddi::IMAGE_TRUSTCACHE.to_vec(),
-    })
+fn load_ddi_bundle() -> Result<Cryptex1Assets> {
+    let manifest: plist::Dictionary = plist::from_bytes(embedded_ddi::BUILD_MANIFEST)?;
+    let build_identity = idevice::tss::select_cryptex_build_identity(&manifest)?.clone();
+    Ok(Cryptex1Assets::from_parts(
+        embedded_ddi::IMAGE_DMG.to_vec(),
+        embedded_ddi::IMAGE_TRUSTCACHE.to_vec(),
+        embedded_ddi::IMAGE_CRYPTEX_INFO.to_vec(),
+        embedded_ddi::IMAGE_ROOT_HASH.to_vec(),
+        build_identity,
+    ))
 }
 
 async fn list_processes(udid: &str) -> Result<Vec<ProcessInfo>> {

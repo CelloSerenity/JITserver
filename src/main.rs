@@ -1160,7 +1160,10 @@ fn recommended_script_for_target(target_name: &str) -> Option<&'static str> {
     let key = script_name_key(target_name);
     match key.as_str() {
         "macios" => Some(MACIOS_SCRIPT_NAME),
-        "amethyst" | "melonx" | "xenios" | "melocafe" | "manic emu" | "dukex" => Some(UNIVERSAL_SCRIPT_NAME),
+        "amethyst" | "melonx" | "xenios" | "melocafe" | "manic emu" | "dukex"
+        | "applesauce" | "rpcs3" => {
+            Some(UNIVERSAL_SCRIPT_NAME)
+        }
         "geode" => Some(GEODE_SCRIPT_NAME),
         "utm" | "dolphinios" | "flycast" | "armsx2ios" => Some(UTM_SCRIPT_NAME),
         _ => None,

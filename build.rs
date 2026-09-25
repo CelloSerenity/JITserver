@@ -1,18 +1,26 @@
 use reqwest::blocking::get;
 use std::{env, fs, path::PathBuf};
 
-const DDI_DOWNLOADS: [(&str, &str); 3] = [
+const DDI_DOWNLOADS: [(&str, &str); 5] = [
     (
         "BuildManifest.plist",
-        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/BuildManifest.plist",
+        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/BuildManifest.plist",
     ),
     (
         "Image.dmg",
-        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/Image.dmg",
+        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg",
     ),
     (
         "Image.dmg.trustcache",
-        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Personalized/Image.dmg.trustcache",
+        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg.trustcache",
+    ),
+    (
+        "Image.dmg.cryptex_info",
+        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg.cryptex_info",
+    ),
+    (
+        "Image.dmg.root_hash",
+        "https://github.com/doronz88/DeveloperDiskImage/raw/refs/heads/main/PersonalizedImages/Xcode_iOS_DDI_Cryptex/Image.dmg.root_hash",
     ),
 ];
 
@@ -44,7 +52,9 @@ fn embed_ddi_bundle() {
         let response = get(url)
             .and_then(|response| response.error_for_status())
             .expect("Failed to download DDI file");
-        let bytes = response.bytes().expect("Failed to read downloaded DDI file");
+        let bytes = response
+            .bytes()
+            .expect("Failed to read downloaded DDI file");
         fs::write(&path, &bytes).expect("Failed to write DDI file into build directory");
     }
 
@@ -52,11 +62,15 @@ fn embed_ddi_bundle() {
         concat!(
             "pub const BUILD_MANIFEST: &[u8] = include_bytes!(r#\"{}\"#);\n",
             "pub const IMAGE_DMG: &[u8] = include_bytes!(r#\"{}\"#);\n",
-            "pub const IMAGE_TRUSTCACHE: &[u8] = include_bytes!(r#\"{}\"#);\n"
+            "pub const IMAGE_TRUSTCACHE: &[u8] = include_bytes!(r#\"{}\"#);\n",
+            "pub const IMAGE_CRYPTEX_INFO: &[u8] = include_bytes!(r#\"{}\"#);\n",
+            "pub const IMAGE_ROOT_HASH: &[u8] = include_bytes!(r#\"{}\"#);\n"
         ),
         ddi_dir.join("BuildManifest.plist").display(),
         ddi_dir.join("Image.dmg").display(),
-        ddi_dir.join("Image.dmg.trustcache").display()
+        ddi_dir.join("Image.dmg.trustcache").display(),
+        ddi_dir.join("Image.dmg.cryptex_info").display(),
+        ddi_dir.join("Image.dmg.root_hash").display()
     );
 
     fs::write(out_dir.join("ddi_bundle.rs"), generated)
