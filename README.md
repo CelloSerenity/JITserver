@@ -16,6 +16,7 @@ Universal script:
   - DukeX
   - AppleSauce
   - RPCS3
+  - AetherPS4
   
 Alternate:
   - UTM

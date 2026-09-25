@@ -174,6 +174,18 @@ impl DebuggerApp {
                         self.logs.push(format!("Process listing failed: {error}"));
                     }
                 },
+                WorkerEvent::DeveloperDiskImageUnmounted(result) => match result {
+                    Ok(()) => {
+                        if let Some(Ok(status)) = self.device_status.as_mut() {
+                            status.developer_disk_image = CheckStatus::Disabled;
+                        }
+                        self.logs
+                            .push("Developer Disk Image unmounted".to_string());
+                    }
+                    Err(error) => self.logs.push(format!(
+                        "Developer Disk Image unmount failed: {error}"
+                    )),
+                },
                 WorkerEvent::Launched(result) => match result {
                     Ok(pid) => {
                         self.manual_pid = pid.to_string();
@@ -587,6 +599,9 @@ impl eframe::App for DebuggerApp {
                             egui::ComboBox::from_id_salt("device_selector")
                                 .selected_text(self.selected_device_label())
                                 .show_ui(ui, |ui| {
+                                    if self.devices.is_empty() {
+                                        ui.label("No devices found");
+                                    }
                                     let mut chosen = None;
                                     for (index, device) in self.devices.iter().enumerate() {
                                         if ui
@@ -605,7 +620,13 @@ impl eframe::App for DebuggerApp {
                                 });
 
                             if let Some(status) = &self.device_status {
-                                render_device_status(ui, status);
+                                if render_device_status(ui, status) && !self.busy {
+                                    if let Some(udid) = self.selected_udid() {
+                                        self.send(WorkerCommand::UnmountDeveloperDiskImage {
+                                            udid,
+                                        });
+                                    }
+                                }
                             } else if self.selected_device.is_some() {
                                 ui.label("Checking wireless debugging, Developer Mode, and DDI...");
                             }
@@ -932,7 +953,8 @@ fn device_label(device: &DeviceInfo) -> String {
     format!("{} ({})", device.name, device.connection)
 }
 
-fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>) {
+fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>) -> bool {
+    let mut unmount_requested = false;
     match status {
         Ok(status) => {
             ui.horizontal(|ui| {
@@ -971,7 +993,17 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
                 ui.label("Developer Disk Image:");
                 match &status.developer_disk_image {
                     CheckStatus::Success => {
-                        ui.label(egui::RichText::new("Mounted").color(egui::Color32::from_rgb(80, 200, 80)));
+                        let response = ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new("Mounted")
+                                        .color(egui::Color32::from_rgb(80, 200, 80)),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text("Shift-click to unmount for testing");
+                        unmount_requested = response.clicked()
+                            && ui.input(|input| input.modifiers.shift);
                     }
                     CheckStatus::Disabled => {
                         ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
@@ -1029,6 +1061,7 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
             });
         }
     }
+    unmount_requested
 }
 
 
@@ -1161,7 +1194,7 @@ fn recommended_script_for_target(target_name: &str) -> Option<&'static str> {
     match key.as_str() {
         "macios" => Some(MACIOS_SCRIPT_NAME),
         "amethyst" | "melonx" | "xenios" | "melocafe" | "manic emu" | "dukex"
-        | "applesauce" | "rpcs3" => {
+        | "applesauce" | "rpcs3" | "aetherps4" => {
             Some(UNIVERSAL_SCRIPT_NAME)
         }
         "geode" => Some(GEODE_SCRIPT_NAME),

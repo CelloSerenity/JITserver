@@ -12,7 +12,7 @@ use idevice::{
     IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::AppServiceClient,
     core_device_proxy::CoreDeviceProxy,
-    cryptexd::{Cryptex1Assets, install_ddi, installed_ddi},
+    cryptexd::{Cryptex1Assets, CryptexdClient, install_ddi, installed_ddi},
     debug_proxy::{DebugProxyClient, DebugserverCommand},
     installation_proxy::InstallationProxyClient,
     mobile_image_mounter::ImageMounter,
@@ -94,6 +94,9 @@ pub enum WorkerCommand {
     ListProcesses {
         udid: String,
     },
+    UnmountDeveloperDiskImage {
+        udid: String,
+    },
     LaunchAndAttach {
         udid: String,
         bundle_id: String,
@@ -124,6 +127,7 @@ pub enum WorkerEvent {
     DeviceStatus(DeviceStatus),
     Apps(Result<Vec<AppInfo>, String>),
     Processes(Result<Vec<ProcessInfo>, String>),
+    DeveloperDiskImageUnmounted(Result<(), String>),
     Launched(Result<u32, String>),
     Attached(Result<String, String>),
     DebugResponse(Result<String, String>),
@@ -182,6 +186,14 @@ impl DeviceWorker {
             WorkerCommand::ListProcesses { udid } => {
                 let processes = list_processes(&udid).await.map_err(format_error);
                 let _ = self.event_tx.send(WorkerEvent::Processes(processes));
+            }
+            WorkerCommand::UnmountDeveloperDiskImage { udid } => {
+                let result = unmount_developer_disk_image(&udid)
+                    .await
+                    .map_err(format_error);
+                let _ = self
+                    .event_tx
+                    .send(WorkerEvent::DeveloperDiskImageUnmounted(result));
             }
             WorkerCommand::LaunchAndAttach { udid, bundle_id } => {
                 let result = async {
@@ -532,6 +544,19 @@ async fn ensure_developer_disk_image(provider: &UsbmuxdProvider) -> Result<bool>
     let ddi = load_ddi_bundle()?;
     install_ddi(&mut adapter, &mut handshake, &ddi).await?;
     Ok(true)
+}
+
+async fn unmount_developer_disk_image(udid: &str) -> Result<()> {
+    let provider = provider_for_udid(udid).await?;
+    let (mut adapter, mut handshake) = connect_rsd(&provider).await?;
+    let installed = installed_ddi(&mut adapter, &mut handshake)
+        .await?
+        .context("developer disk image cryptex is not mounted")?;
+    let client = CryptexdClient::connect_rsd(&mut adapter, &mut handshake).await?;
+    client
+        .uninstall(&installed.identifier, Some(&installed.version))
+        .await?;
+    Ok(())
 }
 
 fn load_ddi_bundle() -> Result<Cryptex1Assets> {
