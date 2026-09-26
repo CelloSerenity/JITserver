@@ -89,7 +89,6 @@ struct DebuggerApp {
 impl DebuggerApp {
     fn new() -> Self {
         let (command_tx, event_rx) = device::spawn_worker();
-        let _ = command_tx.send(WorkerCommand::RefreshDevices);
 
         let scripts_dir = custom_scripts_dir();
         let mut app = Self {
@@ -134,6 +133,15 @@ impl DebuggerApp {
                         self.selected_device = previous_udid.as_ref().and_then(|udid| {
                             self.devices.iter().position(|device| &device.udid == udid)
                         });
+                        if previous_udid.is_some() && self.selected_device.is_none() {
+                            self.apps.clear();
+                            self.processes.clear();
+                            self.selected_app = None;
+                            self.selected_process = None;
+                            self.device_status = None;
+                            self.has_successful_process_list = false;
+                            self.has_logged_process_list = false;
+                        }
                         if self.selected_device.is_none() && self.devices.len() == 1 {
                             self.select_device(0);
                         }
@@ -571,9 +579,6 @@ impl eframe::App for DebuggerApp {
                         |ui| {
                             ui.horizontal(|ui| {
                                 ui.heading("Devices");
-                                if ui.button("Refresh Devices").clicked() {
-                                    self.send(WorkerCommand::RefreshDevices);
-                                }
                                 Self::render_status_indicator(
                                     ui,
                                     if self.attached {
@@ -1000,8 +1005,7 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
                                         .color(egui::Color32::from_rgb(80, 200, 80)),
                                 )
                                 .sense(egui::Sense::click()),
-                            )
-                            .on_hover_text("Shift-click to unmount for testing");
+                            );
                         unmount_requested = response.clicked()
                             && ui.input(|input| input.modifiers.shift);
                     }
@@ -1069,7 +1073,7 @@ const BUNDLED_SCRIPTS: [(&str, &str); 4] = [
     ("Geode.js", include_str!("../scripts/Geode.js")),
     ("maciOS.js", include_str!("../scripts/maciOS.js")),
     ("universal.js", include_str!("../scripts/universal.js")),
-    ("Alternate.js", include_str!("../scripts/Alternate.js")),
+    ("legacy.js", include_str!("../scripts/legacy.js")),
 ];
 
 fn read_script_entries(dir: &Path) -> std::io::Result<Vec<ScriptEntry>> {
@@ -1168,7 +1172,7 @@ fn app_support_dir() -> PathBuf {
 fn is_built_in_script_name(name: &str) -> bool {
     matches!(
         script_name_key(name).as_str(),
-        "geode" | "macios" | "universal" | "alternate"
+        "geode" | "macios" | "universal" | "legacy"
     )
 }
 
@@ -1187,7 +1191,7 @@ const DEFAULT_SCRIPT_NAME: &str = "universal.js";
 const MACIOS_SCRIPT_NAME: &str = "maciOS.js";
 const GEODE_SCRIPT_NAME: &str = "Geode.js";
 const UNIVERSAL_SCRIPT_NAME: &str = "universal.js";
-const UTM_SCRIPT_NAME: &str = "Alternate.js";
+const UTM_SCRIPT_NAME: &str = "legacy.js";
 
 fn recommended_script_for_target(target_name: &str) -> Option<&'static str> {
     let key = script_name_key(target_name);
@@ -1198,7 +1202,7 @@ fn recommended_script_for_target(target_name: &str) -> Option<&'static str> {
             Some(UNIVERSAL_SCRIPT_NAME)
         }
         "geode" => Some(GEODE_SCRIPT_NAME),
-        "utm" | "dolphinios" | "flycast" | "armsx2ios" => Some(UTM_SCRIPT_NAME),
+        "utm" | "dolphinios" | "flycast" | "armsx2" | "armsx2ios" => Some(UTM_SCRIPT_NAME),
         _ => None,
     }
 }

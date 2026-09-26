@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use idevice::{
     IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::AppServiceClient,
@@ -87,7 +88,6 @@ impl Default for CheckStatus {
 
 #[derive(Debug)]
 pub enum WorkerCommand {
-    RefreshDevices,
     ListApps {
         udid: String,
     },
@@ -146,6 +146,12 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerEven
     let (command_tx, command_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
 
+    let device_event_tx = event_tx.clone();
+    thread::spawn(move || {
+        let runtime = Runtime::new().expect("failed to create tokio runtime");
+        runtime.block_on(watch_devices(device_event_tx));
+    });
+
     thread::spawn(move || {
         let runtime = Runtime::new().expect("failed to create tokio runtime");
         let mut worker = DeviceWorker {
@@ -171,10 +177,6 @@ struct DeviceWorker {
 impl DeviceWorker {
     async fn handle(&mut self, command: WorkerCommand) {
         match command {
-            WorkerCommand::RefreshDevices => {
-                let result = refresh_devices().await.map_err(format_error);
-                let _ = self.event_tx.send(WorkerEvent::Devices(result));
-            }
             WorkerCommand::ListApps { udid } => {
                 let device_status = inspect_device_status(&udid).await;
                 let _ = self.event_tx.send(WorkerEvent::DeviceStatus(device_status));
@@ -336,6 +338,45 @@ impl DeviceWorker {
             let result = scripts::run_script(context, source).map_err(format_error);
             let _ = event_tx.send(WorkerEvent::ScriptFinished(result));
         });
+    }
+}
+
+async fn watch_devices(event_tx: mpsc::Sender<WorkerEvent>) {
+    let mut last_error = None;
+    loop {
+        let result = async {
+            let mut mux = UsbmuxdConnection::default().await?;
+            let mut events = mux.listen().await?;
+            let devices = refresh_devices().await?;
+            if event_tx.send(WorkerEvent::Devices(Ok(devices))).is_err() {
+                return Ok(());
+            }
+            last_error = None;
+
+            while let Some(event) = events.next().await {
+                event?;
+                let devices = refresh_devices().await?;
+                if event_tx.send(WorkerEvent::Devices(Ok(devices))).is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            let error = format_error(error);
+            if last_error.as_deref() != Some(error.as_str()) {
+                if event_tx
+                    .send(WorkerEvent::Devices(Err(error.clone())))
+                    .is_err()
+                {
+                    return;
+                }
+                last_error = Some(error);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 

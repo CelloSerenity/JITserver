@@ -9,6 +9,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "futures",
  "idevice",
  "naga",
  "plist",

@@ -14,15 +14,15 @@ Universal script:
   - MeloCafé
   - Manic EMU
   - DukeX
-  - AppleSauce
+  - Applesauce
   - RPCS3
   - AetherPS4
   
-Alternate:
+Legacy script:
   - UTM
   - DolphiniOS
   - Flycast-iOS 26 fork
-  - ARMSX2 iOS
+  - ARMSX2
 
 App-specific:
   - Geode
