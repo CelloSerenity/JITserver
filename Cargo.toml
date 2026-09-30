@@ -33,11 +33,9 @@ naga = { version = "29", features = ["termcolor"] }
 plist = "1.9"
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 rquickjs = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tokio = { version = "1.52", features = ["full"] }
 uuid = { version = "1.23", features = ["serde", "v4"] }
-
-[build-dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Com"] }

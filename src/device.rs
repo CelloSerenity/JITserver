@@ -1,4 +1,5 @@
 use std::{
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -23,15 +24,19 @@ use idevice::{
     tcp::handle::AdapterHandle,
     usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
 };
-use tokio::{runtime::Runtime, sync::Mutex};
+use tokio::{io::AsyncWriteExt, runtime::Runtime, sync::Mutex};
 
 use crate::scripts;
 
 const LABEL: &str = "JITserver";
 
-mod embedded_ddi {
-    include!(concat!(env!("OUT_DIR"), "/ddi_bundle.rs"));
-}
+const DDI_FILES: [&str; 5] = [
+    "BuildManifest.plist",
+    "Image.dmg",
+    "Image.dmg.trustcache",
+    "Image.dmg.cryptex_info",
+    "Image.dmg.root_hash",
+];
 
 #[derive(Clone, Debug, Default)]
 pub struct DeviceInfo {
@@ -54,6 +59,7 @@ pub struct ProcessInfo {
 
 #[derive(Clone, Debug)]
 pub enum RequiresScriptsStatus {
+    Checking,
     Yes,
     No(String),
     Unknown(String),
@@ -61,7 +67,7 @@ pub enum RequiresScriptsStatus {
 
 impl Default for RequiresScriptsStatus {
     fn default() -> Self {
-        Self::Unknown("Not checked yet".to_string())
+        Self::Checking
     }
 }
 
@@ -75,6 +81,8 @@ pub struct DeviceStatus {
 
 #[derive(Clone, Debug)]
 pub enum CheckStatus {
+    Checking,
+    Downloading,
     Success,
     Disabled,
     Failed(String),
@@ -82,7 +90,7 @@ pub enum CheckStatus {
 
 impl Default for CheckStatus {
     fn default() -> Self {
-        Self::Failed("Not checked yet".to_string())
+        Self::Checking
     }
 }
 
@@ -124,7 +132,10 @@ pub enum WorkerCommand {
 pub enum WorkerEvent {
     Busy(bool),
     Devices(Result<Vec<DeviceInfo>, String>),
-    DeviceStatus(DeviceStatus),
+    DeviceStatus {
+        udid: String,
+        status: Result<DeviceStatus, String>,
+    },
     Apps(Result<Vec<AppInfo>, String>),
     Processes(Result<Vec<ProcessInfo>, String>),
     DeveloperDiskImageUnmounted(Result<(), String>),
@@ -178,8 +189,7 @@ impl DeviceWorker {
     async fn handle(&mut self, command: WorkerCommand) {
         match command {
             WorkerCommand::ListApps { udid } => {
-                let device_status = inspect_device_status(&udid).await;
-                let _ = self.event_tx.send(WorkerEvent::DeviceStatus(device_status));
+                inspect_device_status(&udid, &self.event_tx).await;
                 let result = list_apps(&udid).await.map_err(format_error);
                 let _ = self.event_tx.send(WorkerEvent::Apps(result));
                 let processes = list_processes(&udid).await.map_err(format_error);
@@ -442,42 +452,94 @@ async fn list_apps(udid: &str) -> Result<Vec<AppInfo>> {
     Ok(infos)
 }
 
-async fn inspect_device_status(udid: &str) -> DeviceStatus {
+async fn inspect_device_status(udid: &str, event_tx: &mpsc::Sender<WorkerEvent>) {
+    let mut status = DeviceStatus::default();
+    let send_status = |status: Result<DeviceStatus, String>| {
+        let _ = event_tx.send(WorkerEvent::DeviceStatus {
+            udid: udid.to_string(),
+            status,
+        });
+    };
     let provider = match provider_for_udid(udid).await {
         Ok(provider) => provider,
         Err(error) => {
-            let error = format_error(error);
-            return DeviceStatus {
-                wireless_debugging: CheckStatus::Failed(error.clone()),
-                developer_mode: CheckStatus::Failed(error.clone()),
-                developer_disk_image: CheckStatus::Failed(error.clone()),
-                requires_scripts: RequiresScriptsStatus::Unknown(error),
-            };
+            send_status(Err(device_status_error(error)));
+            return;
         }
     };
 
-    DeviceStatus {
-        wireless_debugging: check_status(enable_wireless_debugging(&provider).await),
-        developer_mode: match query_developer_mode(&provider).await {
-            Ok(true) => CheckStatus::Success,
-            Ok(false) => CheckStatus::Disabled,
-            Err(error) => CheckStatus::Failed(format_error(error)),
-        },
-        developer_disk_image: check_status(ensure_developer_disk_image(&provider).await),
-        requires_scripts: match check_requires_scripts(&provider).await {
-            Ok((true, true)) => RequiresScriptsStatus::Yes,
-            Ok((has_txm, is_ios_26)) => {
-                let mut reasons = Vec::new();
-                if !has_txm {
-                    reasons.push("No TXM Detected");
-                }
-                if !is_ios_26 {
-                    reasons.push("Not Running iOS 26+");
-                }
-                RequiresScriptsStatus::No(reasons.join(", "))
+    let wireless = enable_wireless_debugging(&provider).await;
+    if wireless.as_ref().err().is_some_and(is_device_locked) {
+        send_status(Err("Device Locked".to_string()));
+        return;
+    }
+    status.wireless_debugging = check_status(wireless);
+    send_status(Ok(status.clone()));
+
+    let developer_mode = query_developer_mode(&provider).await;
+    if developer_mode.as_ref().err().is_some_and(is_device_locked) {
+        send_status(Err("Device Locked".to_string()));
+        return;
+    }
+    status.developer_mode = match developer_mode {
+        Ok(true) => CheckStatus::Success,
+        Ok(false) => CheckStatus::Disabled,
+        Err(error) => CheckStatus::Failed(format_error(error)),
+    };
+    send_status(Ok(status.clone()));
+
+    let can_mount = !matches!(status.developer_mode, CheckStatus::Disabled);
+    let ddi = ensure_developer_disk_image(&provider, can_mount, || {
+        let mut downloading = status.clone();
+        downloading.developer_disk_image = CheckStatus::Downloading;
+        send_status(Ok(downloading));
+    })
+    .await;
+    if ddi.as_ref().err().is_some_and(is_device_locked) {
+        send_status(Err("Device Locked".to_string()));
+        return;
+    }
+    status.developer_disk_image = match ddi {
+        Ok(false) => CheckStatus::Disabled,
+        other => check_status(other),
+    };
+    send_status(Ok(status.clone()));
+
+    status.requires_scripts = match check_requires_scripts(&provider).await {
+        Ok((true, true)) => RequiresScriptsStatus::Yes,
+        Ok((has_txm, is_ios_26)) => {
+            let mut reasons = Vec::new();
+            if !has_txm {
+                reasons.push("No TXM Detected");
             }
-            Err(error) => RequiresScriptsStatus::Unknown(format_error(error)),
-        },
+            if !is_ios_26 {
+                reasons.push("Not Running iOS 26+");
+            }
+            RequiresScriptsStatus::No(reasons.join(", "))
+        }
+        Err(error) if is_device_locked(&error) => {
+            send_status(Err("Device Locked".to_string()));
+            return;
+        }
+        Err(error) => RequiresScriptsStatus::Unknown(format_error(error)),
+    };
+    send_status(Ok(status));
+}
+
+fn is_device_locked(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<IdeviceError>(),
+            Some(IdeviceError::DeviceLocked | IdeviceError::PasswordProtected)
+        )
+    })
+}
+
+fn device_status_error(error: anyhow::Error) -> String {
+    if is_device_locked(&error) {
+        "Device Locked".to_string()
+    } else {
+        format_error(error)
     }
 }
 
@@ -516,7 +578,10 @@ fn has_txm_hardware(product_type: &str, is_ios_27_or_newer: bool) -> bool {
 }
 
 fn ios_major_version(product_version: &str) -> Option<u32> {
-    product_version.split('.').next().and_then(|s| s.parse::<u32>().ok())
+    product_version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
 }
 
 fn is_ios_26_or_newer(product_version: &str) -> bool {
@@ -525,6 +590,118 @@ fn is_ios_26_or_newer(product_version: &str) -> bool {
 
 fn is_ios_27_or_newer(product_version: &str) -> bool {
     ios_major_version(product_version).is_some_and(|major| major >= 27)
+}
+
+fn uses_cryptex_ddi(product_version: &str) -> bool {
+    let mut parts = product_version.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
+    matches!((major, minor), (Some(major), _) if major > 26)
+        || matches!((major, minor), (Some(26), Some(minor)) if minor >= 4)
+}
+
+async fn ddi_device_info(provider: &UsbmuxdProvider) -> Result<(String, String)> {
+    let mut lockdown = LockdownClient::connect(provider).await?;
+    lockdown
+        .start_session(&provider.get_pairing_file().await?)
+        .await?;
+    let version = lockdown
+        .get_value(Some("ProductVersion"), None)
+        .await?
+        .as_string()
+        .context("missing ProductVersion")?
+        .to_owned();
+    let product_type = lockdown
+        .get_value(Some("ProductType"), None)
+        .await?
+        .as_string()
+        .context("missing ProductType")?
+        .to_owned();
+    Ok((version, product_type))
+}
+
+async fn unique_chip_id(provider: &UsbmuxdProvider) -> Result<u64> {
+    let mut lockdown = LockdownClient::connect(provider).await?;
+    lockdown
+        .start_session(&provider.get_pairing_file().await?)
+        .await?;
+    lockdown
+        .get_value(Some("UniqueChipID"), None)
+        .await?
+        .as_unsigned_integer()
+        .context("missing UniqueChipID")
+}
+
+fn ddi_directory(version: &str, product_type: &str) -> Result<(&'static str, bool)> {
+    let cryptex = uses_cryptex_ddi(version);
+    anyhow::ensure!(
+        product_type.starts_with("iPhone")
+            || product_type.starts_with("iPad")
+            || product_type.starts_with("iPod")
+            || product_type.starts_with("AppleTV"),
+        "unsupported device type: {product_type}"
+    );
+    let directory = match (product_type.starts_with("AppleTV"), cryptex) {
+        (false, false) => "Xcode_iOS_DDI_Personalized",
+        (false, true) => "Xcode_iOS_DDI_Cryptex",
+        (true, false) => "Xcode_tvOS_DDI_Personalized",
+        (true, true) => "Xcode_tvOS_DDI_Cryptex",
+    };
+    Ok((directory, cryptex))
+}
+
+fn ddi_cache_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?);
+    #[cfg(target_os = "macos")]
+    let base =
+        PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join("Library/Caches");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(xdg)
+    } else {
+        PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".cache")
+    };
+    Ok(base.join("JITserver/DDI"))
+}
+
+async fn cached_ddi(directory: &str, cryptex: bool, on_download: impl FnOnce()) -> Result<PathBuf> {
+    let path = ddi_cache_dir()?.join(directory);
+    tokio::fs::create_dir_all(&path).await?;
+    let client = reqwest::Client::new();
+    let count = if cryptex { DDI_FILES.len() } else { 3 };
+    let mut on_download = Some(on_download);
+    for name in &DDI_FILES[..count] {
+        let destination = path.join(name);
+        if tokio::fs::metadata(&destination)
+            .await
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+        {
+            continue;
+        }
+        if let Some(callback) = on_download.take() {
+            callback();
+        }
+        let url = format!(
+            "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/{directory}/{name}"
+        );
+        let mut response = client.get(url).send().await?.error_for_status()?;
+        let partial = path.join(format!("{name}.part"));
+        let mut file = tokio::fs::File::create(&partial).await?;
+        let mut size = 0;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk).await?;
+            size += chunk.len();
+        }
+        file.flush().await?;
+        drop(file);
+        anyhow::ensure!(size > 0, "downloaded empty DDI file: {name}");
+        if destination.exists() {
+            tokio::fs::remove_file(&destination).await?;
+        }
+        tokio::fs::rename(&partial, &destination).await?;
+    }
+    Ok(path)
 }
 
 async fn check_requires_scripts(provider: &UsbmuxdProvider) -> Result<(bool, bool)> {
@@ -568,9 +745,19 @@ async fn query_developer_mode(provider: &UsbmuxdProvider) -> Result<bool> {
     Ok(mounter.query_developer_mode_status().await?)
 }
 
-async fn ensure_developer_disk_image(provider: &UsbmuxdProvider) -> Result<bool> {
+async fn ensure_developer_disk_image(
+    provider: &UsbmuxdProvider,
+    can_mount: bool,
+    on_download: impl FnOnce(),
+) -> Result<bool> {
+    let (version, product_type) = ddi_device_info(provider).await?;
+    let (directory, cryptex) = ddi_directory(&version, &product_type)?;
+    let path = cached_ddi(directory, cryptex, on_download).await?;
+    if !can_mount {
+        return Ok(false);
+    }
     let (mut adapter, mut handshake) = connect_rsd(provider).await?;
-    if installed_ddi(&mut adapter, &mut handshake).await?.is_some() {
+    if cryptex && installed_ddi(&mut adapter, &mut handshake).await?.is_some() {
         return Ok(true);
     }
 
@@ -582,14 +769,37 @@ async fn ensure_developer_disk_image(provider: &UsbmuxdProvider) -> Result<bool>
         Err(e) => return Err(e.into()),
     }
 
-    let ddi = load_ddi_bundle()?;
-    install_ddi(&mut adapter, &mut handshake, &ddi).await?;
+    if cryptex {
+        let ddi = load_ddi_bundle(&path).await?;
+        install_ddi(&mut adapter, &mut handshake, &ddi).await?;
+    } else {
+        let chip_id = unique_chip_id(provider).await?;
+        let mut mounter = ImageMounter::connect_rsd(&mut adapter, &mut handshake).await?;
+        let manifest = tokio::fs::read(path.join("BuildManifest.plist")).await?;
+        mounter
+            .mount_personalized_rsd(
+                &mut adapter,
+                &mut handshake,
+                tokio::fs::read(path.join("Image.dmg")).await?,
+                tokio::fs::read(path.join("Image.dmg.trustcache")).await?,
+                &manifest,
+                None,
+                chip_id,
+            )
+            .await?;
+    }
     Ok(true)
 }
 
 async fn unmount_developer_disk_image(udid: &str) -> Result<()> {
     let provider = provider_for_udid(udid).await?;
+    let (version, _) = ddi_device_info(&provider).await?;
     let (mut adapter, mut handshake) = connect_rsd(&provider).await?;
+    if !uses_cryptex_ddi(&version) {
+        let mut mounter = ImageMounter::connect_rsd(&mut adapter, &mut handshake).await?;
+        mounter.unmount_image("/System/Developer").await?;
+        return Ok(());
+    }
     let installed = installed_ddi(&mut adapter, &mut handshake)
         .await?
         .context("developer disk image cryptex is not mounted")?;
@@ -600,14 +810,15 @@ async fn unmount_developer_disk_image(udid: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_ddi_bundle() -> Result<Cryptex1Assets> {
-    let manifest: plist::Dictionary = plist::from_bytes(embedded_ddi::BUILD_MANIFEST)?;
+async fn load_ddi_bundle(path: &Path) -> Result<Cryptex1Assets> {
+    let manifest: plist::Dictionary =
+        plist::from_bytes(&tokio::fs::read(path.join("BuildManifest.plist")).await?)?;
     let build_identity = idevice::tss::select_cryptex_build_identity(&manifest)?.clone();
     Ok(Cryptex1Assets::from_parts(
-        embedded_ddi::IMAGE_DMG.to_vec(),
-        embedded_ddi::IMAGE_TRUSTCACHE.to_vec(),
-        embedded_ddi::IMAGE_CRYPTEX_INFO.to_vec(),
-        embedded_ddi::IMAGE_ROOT_HASH.to_vec(),
+        tokio::fs::read(path.join("Image.dmg")).await?,
+        tokio::fs::read(path.join("Image.dmg.trustcache")).await?,
+        tokio::fs::read(path.join("Image.dmg.cryptex_info")).await?,
+        tokio::fs::read(path.join("Image.dmg.root_hash")).await?,
         build_identity,
     ))
 }

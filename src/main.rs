@@ -151,8 +151,10 @@ impl DebuggerApp {
                         format_device_refresh_error(&error)
                     )),
                 },
-                WorkerEvent::DeviceStatus(status) => {
-                    self.device_status = Some(Ok(status));
+                WorkerEvent::DeviceStatus { udid, status } => {
+                    if self.selected_udid().as_deref() == Some(udid.as_str()) {
+                        self.device_status = Some(status);
+                    }
                 }
                 WorkerEvent::Apps(result) => match result {
                     Ok(apps) => {
@@ -468,7 +470,7 @@ impl DebuggerApp {
         self.processes.clear();
         self.selected_app = None;
         self.selected_process = None;
-        self.device_status = None;
+        self.device_status = Some(Ok(DeviceStatus::default()));
         self.has_successful_process_list = false;
         self.has_logged_process_list = false;
         self.last_pid_refresh = Instant::now();
@@ -632,8 +634,6 @@ impl eframe::App for DebuggerApp {
                                         });
                                     }
                                 }
-                            } else if self.selected_device.is_some() {
-                                ui.label("Checking wireless debugging, Developer Mode, and DDI...");
                             }
                         },
                     );
@@ -965,6 +965,9 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
             ui.horizontal(|ui| {
                 ui.label("Wireless Debugging:");
                 match &status.wireless_debugging {
+                    CheckStatus::Checking | CheckStatus::Downloading => {
+                        ui.label("Checking");
+                    }
                     CheckStatus::Success => {
                         ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
                     }
@@ -981,6 +984,9 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
             ui.horizontal(|ui| {
                 ui.label("Developer Mode:");
                 match &status.developer_mode {
+                    CheckStatus::Checking | CheckStatus::Downloading => {
+                        ui.label("Checking");
+                    }
                     CheckStatus::Success => {
                         ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
                     }
@@ -997,6 +1003,12 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
             ui.horizontal(|ui| {
                 ui.label("Developer Disk Image:");
                 match &status.developer_disk_image {
+                    CheckStatus::Checking => {
+                        ui.label("Checking");
+                    }
+                    CheckStatus::Downloading => {
+                        ui.label("Downloading");
+                    }
                     CheckStatus::Success => {
                         let response = ui
                             .add(
@@ -1010,7 +1022,9 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
                             && ui.input(|input| input.modifiers.shift);
                     }
                     CheckStatus::Disabled => {
-                        ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
+                        ui.label(
+                            egui::RichText::new("Unmounted (Disabled)").color(egui::Color32::RED),
+                        );
                     }
                     CheckStatus::Failed(e) => {
                         ui.label(
@@ -1022,6 +1036,9 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
             ui.horizontal(|ui| {
                 ui.label("Requires Scripts:");
                 match &status.requires_scripts {
+                    RequiresScriptsStatus::Checking => {
+                        ui.label("Checking");
+                    }
                     RequiresScriptsStatus::Yes => {
                         ui.label(
                             egui::RichText::new("Yes (TXM device on iOS 26+)")
@@ -1044,6 +1061,10 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
             });
         }
         Err(error) => {
+            if error == "Device Locked" {
+                ui.label(egui::RichText::new("Device Locked").color(egui::Color32::RED));
+                return false;
+            }
             ui.horizontal(|ui| {
                 ui.label("Wireless Debugging:");
                 ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
