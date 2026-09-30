@@ -530,7 +530,7 @@ fn is_device_locked(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<IdeviceError>(),
-            Some(IdeviceError::DeviceLocked | IdeviceError::PasswordProtected)
+            Some(IdeviceError::DeviceLocked)
         )
     })
 }
