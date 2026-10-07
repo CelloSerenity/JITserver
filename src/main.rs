@@ -10,8 +10,8 @@ use std::{
 };
 
 use device::{
-    AppInfo, CheckStatus, DeviceInfo, DeviceStatus, ProcessInfo, RequiresScriptsStatus,
-    WorkerCommand, WorkerEvent,
+    AppInfo, CheckStatus, DeviceConnection, DeviceInfo, DeviceStatus, ProcessInfo,
+    RequiresScriptsStatus, WorkerCommand, WorkerEvent,
 };
 use eframe::egui;
 use rfd::FileDialog;
@@ -128,12 +128,27 @@ impl DebuggerApp {
                 WorkerEvent::Busy(busy) => self.busy = busy,
                 WorkerEvent::Devices(result) => match result {
                     Ok(devices) => {
-                        let previous_udid = self.selected_udid();
+                        let previous_device = self
+                            .selected_device
+                            .and_then(|index| self.devices.get(index))
+                            .cloned();
                         self.devices = devices;
-                        self.selected_device = previous_udid.as_ref().and_then(|udid| {
-                            self.devices.iter().position(|device| &device.udid == udid)
+                        self.selected_device = previous_device.as_ref().and_then(|previous| {
+                            self.devices.iter().position(|device| {
+                                device.udid == previous.udid
+                                    && device.connection == previous.connection
+                            })
                         });
-                        if previous_udid.is_some() && self.selected_device.is_none() {
+                        if self.selected_device.is_none()
+                            && let Some(index) = previous_device.as_ref().and_then(|previous| {
+                                self.devices
+                                    .iter()
+                                    .position(|device| device.udid == previous.udid)
+                            })
+                        {
+                            self.select_device(index);
+                        }
+                        if previous_device.is_some() && self.selected_device.is_none() {
                             self.apps.clear();
                             self.processes.clear();
                             self.selected_app = None;
@@ -151,8 +166,18 @@ impl DebuggerApp {
                         format_device_refresh_error(&error)
                     )),
                 },
-                WorkerEvent::DeviceStatus { udid, status } => {
-                    if self.selected_udid().as_deref() == Some(udid.as_str()) {
+                WorkerEvent::DeviceStatus {
+                    udid,
+                    connection,
+                    status,
+                } => {
+                    if self
+                        .selected_device
+                        .and_then(|index| self.devices.get(index))
+                        .is_some_and(|device| {
+                            device.udid == udid && device.connection == connection
+                        })
+                    {
                         self.device_status = Some(status);
                     }
                 }
@@ -474,8 +499,11 @@ impl DebuggerApp {
         self.has_successful_process_list = false;
         self.has_logged_process_list = false;
         self.last_pid_refresh = Instant::now();
-        if let Some(udid) = self.selected_udid() {
-            self.send(WorkerCommand::ListApps { udid });
+        if let Some(device) = self.devices.get(index) {
+            self.send(WorkerCommand::ListApps {
+                udid: device.udid.clone(),
+                connection: device.connection,
+            });
         }
     }
 
@@ -504,8 +532,11 @@ impl DebuggerApp {
     }
 
     fn refresh_selected_device_lists(&mut self) {
-        if let Some(udid) = self.selected_udid() {
-            self.send(WorkerCommand::ListApps { udid });
+        if let Some(device) = self.selected_device.and_then(|index| self.devices.get(index)) {
+            self.send(WorkerCommand::ListApps {
+                udid: device.udid.clone(),
+                connection: device.connection,
+            });
         } else {
             self.logs.push("Select a device first".to_string());
         }
@@ -627,7 +658,11 @@ impl eframe::App for DebuggerApp {
                                 });
 
                             if let Some(status) = &self.device_status {
-                                if render_device_status(ui, status) && !self.busy {
+                                let is_usb = self
+                                    .selected_device
+                                    .and_then(|index| self.devices.get(index))
+                                    .is_some_and(|device| device.connection == DeviceConnection::Usb);
+                                if render_device_status(ui, status, is_usb) && !self.busy {
                                     if let Some(udid) = self.selected_udid() {
                                         self.send(WorkerCommand::UnmountDeveloperDiskImage {
                                             udid,
@@ -955,32 +990,38 @@ impl eframe::App for DebuggerApp {
 }
 
 fn device_label(device: &DeviceInfo) -> String {
-    format!("{} ({})", device.name, device.connection)
+    format!("{} ({})", device.name, device.connection.label())
 }
 
-fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>) -> bool {
+fn render_device_status(
+    ui: &mut egui::Ui,
+    status: &Result<DeviceStatus, String>,
+    is_usb: bool,
+) -> bool {
     let mut unmount_requested = false;
     match status {
         Ok(status) => {
-            ui.horizontal(|ui| {
-                ui.label("Wireless Debugging:");
-                match &status.wireless_debugging {
-                    CheckStatus::Checking | CheckStatus::Downloading => {
-                        ui.label("Checking");
+            if is_usb {
+                ui.horizontal(|ui| {
+                    ui.label("Wireless Debugging:");
+                    match &status.wireless_debugging {
+                        CheckStatus::Checking | CheckStatus::Downloading => {
+                            ui.label("Checking");
+                        }
+                        CheckStatus::Success => {
+                            ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
+                        }
+                        CheckStatus::Disabled => {
+                            ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
+                        }
+                        CheckStatus::Failed(e) => {
+                            ui.label(
+                                egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
+                            );
+                        }
                     }
-                    CheckStatus::Success => {
-                        ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
-                    }
-                    CheckStatus::Disabled => {
-                        ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
-                    }
-                    CheckStatus::Failed(e) => {
-                        ui.label(
-                            egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
-                        );
-                    }
-                }
-            });
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Developer Mode:");
                 match &status.developer_mode {
@@ -1065,10 +1106,14 @@ fn render_device_status(ui: &mut egui::Ui, status: &Result<DeviceStatus, String>
                 ui.label(egui::RichText::new("Device Locked").color(egui::Color32::RED));
                 return false;
             }
-            ui.horizontal(|ui| {
-                ui.label("Wireless Debugging:");
-                ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
-            });
+            if is_usb {
+                ui.horizontal(|ui| {
+                    ui.label("Wireless Debugging:");
+                    ui.label(
+                        egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED),
+                    );
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Developer Mode:");
                 ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));

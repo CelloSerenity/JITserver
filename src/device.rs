@@ -42,7 +42,15 @@ const DDI_FILES: [&str; 5] = [
 pub struct DeviceInfo {
     pub udid: String,
     pub name: String,
-    pub connection: String,
+    pub connection: DeviceConnection,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DeviceConnection {
+    Usb,
+    Network,
+    #[default]
+    Other,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,6 +106,7 @@ impl Default for CheckStatus {
 pub enum WorkerCommand {
     ListApps {
         udid: String,
+        connection: DeviceConnection,
     },
     ListProcesses {
         udid: String,
@@ -134,6 +143,7 @@ pub enum WorkerEvent {
     Devices(Result<Vec<DeviceInfo>, String>),
     DeviceStatus {
         udid: String,
+        connection: DeviceConnection,
         status: Result<DeviceStatus, String>,
     },
     Apps(Result<Vec<AppInfo>, String>),
@@ -188,8 +198,8 @@ struct DeviceWorker {
 impl DeviceWorker {
     async fn handle(&mut self, command: WorkerCommand) {
         match command {
-            WorkerCommand::ListApps { udid } => {
-                inspect_device_status(&udid, &self.event_tx).await;
+            WorkerCommand::ListApps { udid, connection } => {
+                inspect_device_status(&udid, connection, &self.event_tx).await;
                 let result = list_apps(&udid).await.map_err(format_error);
                 let _ = self.event_tx.send(WorkerEvent::Apps(result));
                 let processes = list_processes(&udid).await.map_err(format_error);
@@ -415,7 +425,7 @@ async fn refresh_devices() -> Result<Vec<DeviceInfo>> {
         infos.push(DeviceInfo {
             udid: device.udid,
             name,
-            connection: connection_label(&device.connection_type),
+            connection: DeviceConnection::from(&device.connection_type),
         });
     }
 
@@ -452,15 +462,20 @@ async fn list_apps(udid: &str) -> Result<Vec<AppInfo>> {
     Ok(infos)
 }
 
-async fn inspect_device_status(udid: &str, event_tx: &mpsc::Sender<WorkerEvent>) {
+async fn inspect_device_status(
+    udid: &str,
+    connection: DeviceConnection,
+    event_tx: &mpsc::Sender<WorkerEvent>,
+) {
     let mut status = DeviceStatus::default();
     let send_status = |status: Result<DeviceStatus, String>| {
         let _ = event_tx.send(WorkerEvent::DeviceStatus {
             udid: udid.to_string(),
+            connection,
             status,
         });
     };
-    let provider = match provider_for_udid(udid).await {
+    let provider = match provider_for_udid_with_connection(udid, connection).await {
         Ok(provider) => provider,
         Err(error) => {
             send_status(Err(device_status_error(error)));
@@ -468,13 +483,15 @@ async fn inspect_device_status(udid: &str, event_tx: &mpsc::Sender<WorkerEvent>)
         }
     };
 
-    let wireless = enable_wireless_debugging(&provider).await;
-    if wireless.as_ref().err().is_some_and(is_device_locked) {
-        send_status(Err("Device Locked".to_string()));
-        return;
+    if connection == DeviceConnection::Usb {
+        let wireless = enable_wireless_debugging(&provider).await;
+        if wireless.as_ref().err().is_some_and(is_device_locked) {
+            send_status(Err("Device Locked".to_string()));
+            return;
+        }
+        status.wireless_debugging = check_status(wireless);
+        send_status(Ok(status.clone()));
     }
-    status.wireless_debugging = check_status(wireless);
-    send_status(Ok(status.clone()));
 
     let developer_mode = query_developer_mode(&provider).await;
     if developer_mode.as_ref().err().is_some_and(is_device_locked) {
@@ -960,6 +977,26 @@ async fn provider_for_udid(udid: &str) -> Result<UsbmuxdProvider> {
     Ok(device.to_provider(UsbmuxdAddr::default(), LABEL))
 }
 
+async fn provider_for_udid_with_connection(
+    udid: &str,
+    connection: DeviceConnection,
+) -> Result<UsbmuxdProvider> {
+    let mut mux = UsbmuxdConnection::default().await?;
+    let devices = mux.get_devices().await?;
+    let device = devices
+        .into_iter()
+        .find(|device| {
+            device.udid == udid && DeviceConnection::from(&device.connection_type) == connection
+        })
+        .with_context(|| {
+            format!(
+                "device {udid} is no longer connected via {}",
+                connection.label()
+            )
+        })?;
+    Ok(device.to_provider(UsbmuxdAddr::default(), LABEL))
+}
+
 pub fn prepare_memory_region_packets(start_addr: u64, region_size: u64) -> Vec<u8> {
     const JIT_PAGE_SIZE: u64 = 16 * 1024;
     if region_size == 0 {
@@ -984,11 +1021,23 @@ fn format_error(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-fn connection_label(connection: &Connection) -> String {
-    match connection {
-        Connection::Usb => "USB".to_string(),
-        Connection::Network(_) => "Network".to_string(),
-        Connection::Unknown(_) => "Other".to_string(),
+impl DeviceConnection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Usb => "USB",
+            Self::Network => "Network",
+            Self::Other => "Other",
+        }
+    }
+}
+
+impl From<&Connection> for DeviceConnection {
+    fn from(connection: &Connection) -> Self {
+        match connection {
+            Connection::Usb => Self::Usb,
+            Connection::Network(_) => Self::Network,
+            Connection::Unknown(_) => Self::Other,
+        }
     }
 }
 
