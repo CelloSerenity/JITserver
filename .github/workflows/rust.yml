@@ -2,19 +2,13 @@ name: Build & Bundle
 on:
   push:
     branches: ["main"]
+    tags: ["v*.*.*"]
   pull_request:
-    branches: ["main"]
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to build"
-        required: false
-        default: "1.0.0"
 
 env:
   BINARY_NAME: JITserver
   APP_NAME: JITserver
-  VERSION: ${{ github.event.inputs.version }}
   ICON_PNG: Linux.png
   CARGO_TERM_COLOR: always
 
@@ -47,26 +41,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libglib2.0-dev \
-            libatk1.0-dev \
-            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
             pkg-config \
-            libfuse2 \
+            libfuse2t64 \
             appstream \
             usbmuxd
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{matrix.target}}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{matrix.target}}-cargo-
+          key: ${{ matrix.target }}
 
       - name: Build binary
-        run: cargo build --release --no-default-features --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
+        run: cargo build --release --locked --bin ${{ env.BINARY_NAME }} --target ${{ matrix.target }}
 
       - name: Download appimagetool
         run: |
@@ -127,19 +117,14 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{matrix.target}}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{matrix.target}}-cargo-
+          key: ${{ matrix.target }}
 
       - name: Build ${{ matrix.arch }} slice
         run: |
           cargo build --release \
-            --no-default-features \
+            --locked \
             --bin ${{ env.BINARY_NAME }} \
             --target ${{ matrix.target }}
 
@@ -192,6 +177,7 @@ jobs:
       - name: Build & Assemble Universal .app
         run: |
           APP="${{ env.APP_NAME }}.app"
+          VERSION="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
           # 1) Merge slices
@@ -208,8 +194,8 @@ jobs:
             <key>CFBundleName</key><string>${{ env.APP_NAME }}</string>
             <key>CFBundleDisplayName</key><string>${{ env.APP_NAME }}</string>
             <key>CFBundleIdentifier</key><string>com.github.celloserenity.${{ env.APP_NAME }}</string>
-            <key>CFBundleVersion</key><string>${{ env.VERSION }}</string>
-            <key>CFBundleShortVersionString</key><string>${{ env.VERSION }}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
             <key>CFBundleExecutable</key><string>${{ env.APP_NAME }}</string>
             <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleIconFile</key><string>AppIcon.icns</string>
@@ -242,14 +228,18 @@ jobs:
         run: |
           DMG="dist/${{ env.APP_NAME }}-macos-universal.dmg"
           mkdir -p dist dmg-staging
-          cp -R "${{ env.APP_NAME }}.app" dmg-staging/
+          trap 'rm -rf dmg-staging' EXIT
+          mv "${{ env.APP_NAME }}.app" dmg-staging/
           ln -s /Applications dmg-staging/Applications
+          APP_SIZE_KB="$(du -sk dmg-staging | awk '{ print $1 }')"
+          DMG_SIZE_KB="$((APP_SIZE_KB * 2 + 131072))"
+          sync
           hdiutil create \
             -volname "${{ env.APP_NAME }}" \
             -srcfolder dmg-staging \
+            -size "${DMG_SIZE_KB}k" \
             -ov -format UDZO \
             "$DMG"
-          rm -rf dmg-staging
           echo "$DMG" > dmg-path.txt
 
       - name: Notarize & Staple DMG
@@ -279,18 +269,13 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
       - name: Cache Cargo
-        uses: actions/cache@v5
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-cargo-
+          key: x86_64-pc-windows-msvc
       - name: Build and Rename Executable
         shell: bash
         run: |
-          cargo build --release --no-default-features --bin ${{ env.BINARY_NAME }} --target x86_64-pc-windows-msvc
+          cargo build --release --locked --bin ${{ env.BINARY_NAME }} --target x86_64-pc-windows-msvc
           mkdir -p release
           cp target/x86_64-pc-windows-msvc/release/${{ env.BINARY_NAME }}.exe \
              release/${{ env.APP_NAME }}-windows-x86_64.exe
@@ -299,3 +284,23 @@ jobs:
         with:
           name: ${{ env.APP_NAME }}-windows-x86_64.exe
           path: release/${{ env.APP_NAME }}-windows-x86_64.exe
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-24.04
+    needs: [build-appimage, build-windows, macos-bundle]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: JITserver-*
+          path: release-assets
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

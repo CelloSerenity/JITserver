@@ -56,6 +56,8 @@ App-specific:
    - [AArch64](https://github.com/CelloSerenity/JITserver/releases/latest/download/JITserver-linux-aarch64.AppImage)
 3. Make the downloaded file executable
 
+Importing scripts opens the desktop file chooser through XDG Desktop Portal. On minimal Linux installations, install `xdg-desktop-portal` and a backend for your desktop environment.
+
 ### Prerequisites for JIT
 
 Before enabling JIT, make sure you have:

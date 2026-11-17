@@ -19,13 +19,9 @@ use rfd::FileDialog;
 fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1120.0, 760.0]),
+        renderer: pick_renderer(),
         ..Default::default()
     };
-
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-    {
-        options.renderer = eframe::Renderer::Glow;
-    }
 
     #[cfg(target_os = "macos")]
     {
@@ -39,11 +35,61 @@ fn main() -> eframe::Result {
         options.viewport.icon = Some(std::sync::Arc::new(d));
     }
 
+    use eframe::egui_wgpu::WgpuSetup;
+    if let WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        let defaults = std::sync::Arc::clone(&setup.device_descriptor);
+        setup.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut descriptor = defaults(adapter);
+            descriptor.required_limits = descriptor
+                .required_limits
+                .or_worse_values_from(&adapter.limits());
+            descriptor
+        });
+    }
+
     eframe::run_native(
         &format!("JITserver v{}", env!("CARGO_PKG_VERSION")),
         options,
-        Box::new(|_cc| Ok(Box::new(DebuggerApp::new()))),
+        Box::new(|cc| {
+            cc.egui_ctx.all_styles_mut(|style| {
+                style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+                style.spacing.button_padding = egui::vec2(10.0, 5.0);
+            });
+            Ok(Box::new(DebuggerApp::new()))
+        }),
     )
+}
+
+#[cfg(target_os = "macos")]
+fn pick_renderer() -> eframe::Renderer {
+    use eframe::wgpu;
+
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
+    descriptor.backends = wgpu::Backends::METAL;
+    let instance = wgpu::Instance::new(descriptor);
+    let metal_available = pollster::block_on(async {
+        let Ok(adapter) = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+        else {
+            return false;
+        };
+        adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .is_ok()
+    });
+
+    if metal_available {
+        eframe::Renderer::Wgpu
+    } else {
+        eframe::Renderer::Glow
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pick_renderer() -> eframe::Renderer {
+    eframe::Renderer::Wgpu
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +124,7 @@ struct DebuggerApp {
     script_source: String,
     device_status: Option<Result<DeviceStatus, String>>,
     logs: Vec<String>,
+    show_logs: bool,
     busy: bool,
     attached: bool,
     script_running: bool,
@@ -110,6 +157,7 @@ impl DebuggerApp {
             script_source: String::new(),
             device_status: None,
             logs: Vec::new(),
+            show_logs: false,
             busy: false,
             attached: false,
             script_running: false,
@@ -595,9 +643,65 @@ impl eframe::App for DebuggerApp {
         self.drain_events();
         self.maybe_refresh_processes();
 
-        egui::CentralPanel::default().show_inside(ui, |ui| {
-            let devices_height = 180.0;
-            let log_height = 180.0;
+        egui::Panel::top("device_bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Device");
+                egui::ComboBox::from_id_salt("device_selector")
+                    .selected_text(self.selected_device_label())
+                    .show_ui(ui, |ui| {
+                        if self.devices.is_empty() {
+                            ui.label("No devices found");
+                        }
+                        let mut chosen = None;
+                        for (index, device) in self.devices.iter().enumerate() {
+                            if ui
+                                .selectable_label(
+                                    self.selected_device == Some(index),
+                                    device_label(device),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(index);
+                            }
+                        }
+                        if let Some(index) = chosen {
+                            self.select_device(index);
+                        }
+                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.toggle_value(&mut self.show_logs, "Logs");
+                });
+            });
+        });
+
+        egui::Panel::bottom("logs")
+            .resizable(true)
+            .default_size(180.0)
+            .show_collapsible(ui, &mut self.show_logs, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Log");
+                    if ui.button("Copy Logs").clicked() {
+                        ui.ctx().copy_text(self.logs.join("\n"));
+                        self.logs.push("Copied logs to clipboard".to_string());
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.logs.clear();
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(self.logs.join("\n")).monospace())
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    });
+            });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            let devices_height = 150.0;
             let top_spacing = 8.0;
 
             egui::ScrollArea::both()
@@ -611,7 +715,7 @@ impl eframe::App for DebuggerApp {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.horizontal(|ui| {
-                                ui.heading("Devices");
+                                ui.heading("Device Status");
                                 Self::render_status_indicator(
                                     ui,
                                     if self.attached {
@@ -634,28 +738,6 @@ impl eframe::App for DebuggerApp {
                                     ui.spinner();
                                 }
                             });
-                            egui::ComboBox::from_id_salt("device_selector")
-                                .selected_text(self.selected_device_label())
-                                .show_ui(ui, |ui| {
-                                    if self.devices.is_empty() {
-                                        ui.label("No devices found");
-                                    }
-                                    let mut chosen = None;
-                                    for (index, device) in self.devices.iter().enumerate() {
-                                        if ui
-                                            .selectable_label(
-                                                self.selected_device == Some(index),
-                                                device_label(device),
-                                            )
-                                            .clicked()
-                                        {
-                                            chosen = Some(index);
-                                        }
-                                    }
-                                    if let Some(index) = chosen {
-                                        self.select_device(index);
-                                    }
-                                });
 
                             if let Some(status) = &self.device_status {
                                 let is_usb = self
@@ -882,7 +964,7 @@ impl eframe::App for DebuggerApp {
                 });
 
                         columns[1].vertical(|ui| {
-                    let script_height = (ui.available_height() - log_height - 12.0).clamp(120.0, 340.0);
+                    let script_height = ui.available_height().clamp(120.0, 340.0);
 
                     ui.allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), script_height),
@@ -951,41 +1033,13 @@ impl eframe::App for DebuggerApp {
                         },
                     );
 
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.heading("Log");
-                        if ui.button("Copy Logs").clicked() {
-                            ui.ctx().copy_text(self.logs.join("\n"));
-                            self.logs.push("Copied logs to clipboard".to_string());
-                        }
-                        if ui.button("Clear").clicked() {
-                            self.logs.clear();
-                        }
-                    });
-                    let log_text = self.logs.join("\n");
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_height(log_height);
-                        egui::ScrollArea::vertical()
-                            .id_salt("logs")
-                            .max_height(log_height)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.add(
-                                        egui::Label::new(egui::RichText::new(log_text).monospace())
-                                            .selectable(true)
-                                            .wrap(),
-                                    );
-                                });
-                            });
-                    });
                         });
                     });
                 });
         });
 
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 

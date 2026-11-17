@@ -6,17 +6,9 @@ license = "AGPL-3.0"
 
 [dependencies]
 anyhow = "1"
-eframe = { version = "0.34.3", default-features = false, features = [
-  "default_fonts",
-  "accesskit",
-  "wgpu",
-  "glow",
-  "wayland",
-  "x11",
-] }
-egui = "0.34.3"
+eframe = "0.36.2"
 futures = "0.3"
-idevice = { version = "0.1.68", features = [
+idevice = { version = "0.1.68", default-features = false, features = [
   "core_device",
   "core_device_proxy",
   "cryptexd",
@@ -24,21 +16,29 @@ idevice = { version = "0.1.68", features = [
   "dvt",
   "installation_proxy",
   "mobile_image_mounter",
+  "ring",
   "rsd",
   "tss",
   "tunnel_tcp_stack",
   "usbmuxd",
 ] }
-naga = { version = "29", features = ["termcolor"] }
 plist = "1.9"
-rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+rfd = "0.17"
 rquickjs = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-tokio = { version = "1.52", features = ["full"] }
-uuid = { version = "1.23", features = ["serde", "v4"] }
+tokio = { version = "1.53.2", features = ["fs", "io-util", "net", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1.27", features = ["serde", "v4"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Com"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.36.2", features = ["glow"] }
+pollster = "1.0"
 
 [target.'cfg(windows)'.build-dependencies]
-winres = "0.1.12"
+winresource = "0.1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = true
