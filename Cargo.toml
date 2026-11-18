@@ -30,7 +30,10 @@ tokio = { version = "1.53.2", features = ["fs", "io-util", "net", "rt-multi-thre
 uuid = { version = "1.27", features = ["serde", "v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3"
 eframe = { version = "0.36.2", features = ["glow"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSResponder"] }
 pollster = "1.0"
 
 [target.'cfg(windows)'.build-dependencies]

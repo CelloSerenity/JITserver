@@ -138,8 +138,15 @@ pub enum WorkerCommand {
 }
 
 #[derive(Debug)]
+pub enum WorkerActivity {
+    Idle,
+    Background,
+    Foreground,
+}
+
+#[derive(Debug)]
 pub enum WorkerEvent {
-    Busy(bool),
+    Activity(WorkerActivity),
     Devices(Result<Vec<DeviceInfo>, String>),
     DeviceStatus {
         udid: String,
@@ -181,9 +188,15 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerEven
         };
 
         while let Ok(command) = command_rx.recv() {
-            let _ = worker.event_tx.send(WorkerEvent::Busy(true));
+            let activity = match &command {
+                WorkerCommand::ListProcesses { .. } => WorkerActivity::Background,
+                _ => WorkerActivity::Foreground,
+            };
+            let _ = worker.event_tx.send(WorkerEvent::Activity(activity));
             runtime.block_on(worker.handle(command));
-            let _ = worker.event_tx.send(WorkerEvent::Busy(false));
+            let _ = worker
+                .event_tx
+                .send(WorkerEvent::Activity(WorkerActivity::Idle));
         }
     });
 

@@ -7,9 +7,12 @@ name = "JITserver"
 version = "1.2.0"
 dependencies = [
  "anyhow",
+ "dispatch2",
  "eframe",
  "futures",
  "idevice",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "plist",
  "pollster 1.0.2",
  "reqwest",

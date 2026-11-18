@@ -11,7 +11,7 @@ use std::{
 
 use device::{
     AppInfo, CheckStatus, DeviceConnection, DeviceInfo, DeviceStatus, ProcessInfo,
-    RequiresScriptsStatus, WorkerCommand, WorkerEvent,
+    RequiresScriptsStatus, WorkerActivity, WorkerCommand, WorkerEvent,
 };
 use eframe::egui;
 use rfd::FileDialog;
@@ -125,7 +125,7 @@ struct DebuggerApp {
     device_status: Option<Result<DeviceStatus, String>>,
     logs: Vec<String>,
     show_logs: bool,
-    busy: bool,
+    worker_activity: WorkerActivity,
     attached: bool,
     script_running: bool,
     last_pid_refresh: Instant,
@@ -158,7 +158,7 @@ impl DebuggerApp {
             device_status: None,
             logs: Vec::new(),
             show_logs: false,
-            busy: false,
+            worker_activity: WorkerActivity::Idle,
             attached: false,
             script_running: false,
             last_pid_refresh: Instant::now(),
@@ -173,7 +173,7 @@ impl DebuggerApp {
     fn drain_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                WorkerEvent::Busy(busy) => self.busy = busy,
+                WorkerEvent::Activity(activity) => self.worker_activity = activity,
                 WorkerEvent::Devices(result) => match result {
                     Ok(devices) => {
                         let previous_device = self
@@ -598,7 +598,10 @@ impl DebuggerApp {
     }
 
     fn maybe_refresh_processes(&mut self) {
-        if self.busy || self.selected_device.is_none() || !self.has_successful_process_list {
+        if !matches!(self.worker_activity, WorkerActivity::Idle)
+            || self.selected_device.is_none()
+            || !self.has_successful_process_list
+        {
             return;
         }
 
@@ -639,6 +642,18 @@ impl DebuggerApp {
 }
 
 impl eframe::App for DebuggerApp {
+    #[cfg(target_os = "macos")]
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested()) {
+            // Keep the native view alive until AppKit quits to avoid the Touch Bar observer crash.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            dispatch2::DispatchQueue::main().exec_async(|| {
+                let mtm = objc2::MainThreadMarker::new().expect("running on the main queue");
+                objc2_app_kit::NSApplication::sharedApplication(mtm).terminate(None);
+            });
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.maybe_refresh_processes();
@@ -734,7 +749,7 @@ impl eframe::App for DebuggerApp {
                                     },
                                     "Script Running",
                                 );
-                                if self.busy {
+                                if matches!(self.worker_activity, WorkerActivity::Foreground) {
                                     ui.spinner();
                                 }
                             });
@@ -744,7 +759,9 @@ impl eframe::App for DebuggerApp {
                                     .selected_device
                                     .and_then(|index| self.devices.get(index))
                                     .is_some_and(|device| device.connection == DeviceConnection::Usb);
-                                if render_device_status(ui, status, is_usb) && !self.busy {
+                                if render_device_status(ui, status, is_usb)
+                                    && matches!(self.worker_activity, WorkerActivity::Idle)
+                                {
                                     if let Some(udid) = self.selected_udid() {
                                         self.send(WorkerCommand::UnmountDeveloperDiskImage {
                                             udid,
