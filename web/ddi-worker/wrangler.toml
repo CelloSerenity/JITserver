@@ -1,0 +1,10 @@
+name = "jitserver"
+main = "worker.mjs"
+compatibility_date = "2026-11-18"
+workers_dev = true
+
+[vars]
+ALLOWED_ORIGINS = "https://celloserenity.github.io"
+
+[observability]
+enabled = false

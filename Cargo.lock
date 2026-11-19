@@ -13,6 +13,7 @@ dependencies = [
  "idevice",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
+ "percent-encoding",
  "plist",
  "pollster 1.0.2",
  "reqwest",

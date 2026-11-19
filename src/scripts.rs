@@ -9,10 +9,7 @@ use idevice::{ReadWrite, debug_proxy::DebugserverCommand};
 use rquickjs::{CatchResultExt, Context, Error as JsError, Runtime, function::Func};
 use tokio::sync::Mutex;
 
-use crate::device::{self, WorkerEvent};
-
-const PREPARE_MEMORY_REGION_PACKET_SIZE: usize = 19;
-const PREPARE_MEMORY_REGION_BATCH_COMMANDS: usize = 128;
+use crate::{device::WorkerEvent, jit_memory};
 
 pub struct ScriptContext {
     pub name: String,
@@ -100,40 +97,12 @@ pub fn run_script(script_context: ScriptContext, source: String) -> Result<()> {
                 Func::from(
                     move |start_addr: u64, region_size: u64| -> rquickjs::Result<String> {
                         ensure_not_cancelled(&prepare_stop)?;
-                        let packet_buffer =
-                            device::prepare_memory_region_packets(start_addr, region_size);
                         prepare_handle
                             .block_on(async {
                                 let mut debug_proxy = prepare_debug.lock().await;
-                                if packet_buffer.is_empty() {
-                                    return anyhow::Ok("OK".to_string());
-                                }
-
-                                let command_count =
-                                    packet_buffer.len() / PREPARE_MEMORY_REGION_PACKET_SIZE;
-
-                                for batch_start in
-                                    (0..command_count).step_by(PREPARE_MEMORY_REGION_BATCH_COMMANDS)
-                                {
-                                    let commands_in_batch = std::cmp::min(
-                                        PREPARE_MEMORY_REGION_BATCH_COMMANDS,
-                                        command_count - batch_start,
-                                    );
-                                    let byte_start =
-                                        batch_start * PREPARE_MEMORY_REGION_PACKET_SIZE;
-                                    let byte_end = byte_start
-                                        + (commands_in_batch * PREPARE_MEMORY_REGION_PACKET_SIZE);
-                                    debug_proxy
-                                        .send_raw(&packet_buffer[byte_start..byte_end])
-                                        .await?;
-
-                                    for _ in 0..commands_in_batch {
-                                        debug_proxy.read_response().await?.ok_or_else(|| {
-                                            anyhow!("missing debugserver response")
-                                        })?;
-                                    }
-                                }
-                                anyhow::Ok("OK".to_string())
+                                jit_memory::prepare(&mut debug_proxy, start_addr, region_size)
+                                    .await
+                                    .map(|()| "OK".to_owned())
                             })
                             .map_err(|error| {
                                 JsError::new_from_js_message(

@@ -1,6 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod device;
+mod device_services;
+mod jit_memory;
+mod script_catalog;
 mod scripts;
+mod targets;
+mod ui;
 
 use std::{
     env, fs,
@@ -10,11 +15,15 @@ use std::{
 };
 
 use device::{
-    AppInfo, CheckStatus, DeviceConnection, DeviceInfo, DeviceStatus, ProcessInfo,
-    RequiresScriptsStatus, WorkerActivity, WorkerCommand, WorkerEvent,
+    CheckStatus, DeviceConnection, DeviceInfo, DeviceStatus, DiskImageAction, WorkerActivity,
+    WorkerCommand, WorkerEvent,
 };
+use device_services::RequiresScriptsStatus;
 use eframe::egui;
 use rfd::FileDialog;
+use script_catalog::{BundledScript, script_name_key};
+use targets::{AppInfo, PROCESS_REFRESH_INTERVAL, ProcessInfo};
+use ui::JitAction;
 
 fn main() -> eframe::Result {
     let mut options = eframe::NativeOptions {
@@ -51,10 +60,7 @@ fn main() -> eframe::Result {
         &format!("JITserver v{}", env!("CARGO_PKG_VERSION")),
         options,
         Box::new(|cc| {
-            cc.egui_ctx.all_styles_mut(|style| {
-                style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-                style.spacing.button_padding = egui::vec2(10.0, 5.0);
-            });
+            ui::setup(&cc.egui_ctx);
             Ok(Box::new(DebuggerApp::new()))
         }),
     )
@@ -112,7 +118,7 @@ struct DebuggerApp {
     apps: Vec<AppInfo>,
     processes: Vec<ProcessInfo>,
     selected_device: Option<usize>,
-    selected_app: Option<usize>,
+    selected_app: Option<String>,
     selected_process: Option<u32>,
     app_filter: String,
     process_filter: String,
@@ -126,6 +132,7 @@ struct DebuggerApp {
     logs: Vec<String>,
     show_logs: bool,
     worker_activity: WorkerActivity,
+    disk_image_pending: bool,
     attached: bool,
     script_running: bool,
     last_pid_refresh: Instant,
@@ -157,8 +164,9 @@ impl DebuggerApp {
             script_source: String::new(),
             device_status: None,
             logs: Vec::new(),
-            show_logs: false,
+            show_logs: true,
             worker_activity: WorkerActivity::Idle,
+            disk_image_pending: false,
             attached: false,
             script_running: false,
             last_pid_refresh: Instant::now(),
@@ -166,7 +174,7 @@ impl DebuggerApp {
             has_logged_process_list: false,
         };
         app.refresh_scripts();
-        app.select_script_by_name(DEFAULT_SCRIPT_NAME);
+        app.select_script_by_name(BundledScript::default().name());
         app
     }
 
@@ -194,7 +202,7 @@ impl DebuggerApp {
                                     .position(|device| device.udid == previous.udid)
                             })
                         {
-                            self.select_device(index);
+                            self.select_device(index, true);
                         }
                         if previous_device.is_some() && self.selected_device.is_none() {
                             self.apps.clear();
@@ -206,7 +214,7 @@ impl DebuggerApp {
                             self.has_logged_process_list = false;
                         }
                         if self.selected_device.is_none() && self.devices.len() == 1 {
-                            self.select_device(0);
+                            self.select_device(0, true);
                         }
                     }
                     Err(error) => self.logs.push(format!(
@@ -234,12 +242,14 @@ impl DebuggerApp {
                         self.logs
                             .push(format!("Loaded {} app(s) with get-task-allow", apps.len()));
                         self.apps = apps;
+                        targets::prioritize_processes(&mut self.processes, &self.apps);
                         self.selected_app = None;
                     }
                     Err(error) => self.logs.push(format!("App listing failed: {error}")),
                 },
                 WorkerEvent::Processes(result) => match result {
-                    Ok(processes) => {
+                    Ok(mut processes) => {
+                        targets::prioritize_processes(&mut processes, &self.apps);
                         let previous_pid = self.selected_process;
                         if !self.has_logged_process_list {
                             self.logs
@@ -257,18 +267,47 @@ impl DebuggerApp {
                         self.logs.push(format!("Process listing failed: {error}"));
                     }
                 },
-                WorkerEvent::DeveloperDiskImageUnmounted(result) => match result {
-                    Ok(()) => {
-                        if let Some(Ok(status)) = self.device_status.as_mut() {
-                            status.developer_disk_image = CheckStatus::Disabled;
+                WorkerEvent::DeveloperDiskImage {
+                    udid,
+                    connection,
+                    action,
+                    result,
+                } => {
+                    self.disk_image_pending = false;
+                    let selected = self
+                        .selected_device
+                        .and_then(|index| self.devices.get(index))
+                        .is_some_and(|device| device.udid == udid && device.connection == connection);
+                    let (disk_image_status, log) = match (action, result) {
+                        (DiskImageAction::Mount, Ok(())) => (
+                            Some(CheckStatus::Success),
+                            "Developer Disk Image mounted".to_string(),
+                        ),
+                        (DiskImageAction::Mount, Err(error)) => {
+                            let log = format!("Developer Disk Image mount failed: {error}");
+                            (Some(CheckStatus::Failed(error)), log)
                         }
-                        self.logs
-                            .push("Developer Disk Image unmounted".to_string());
+                        (DiskImageAction::Unmount, Ok(())) => (
+                            Some(CheckStatus::Disabled),
+                            "Developer Disk Image unmounted".to_string(),
+                        ),
+                        (DiskImageAction::Unmount, Err(error)) => (
+                            None,
+                            format!("Developer Disk Image unmount failed: {error}"),
+                        ),
+                    };
+                    self.logs.push(log);
+                    if selected
+                        && let Some(new_status) = disk_image_status
+                        && let Some(Ok(status)) = self.device_status.as_mut()
+                    {
+                        let mounted = matches!(new_status, CheckStatus::Success);
+                        status.developer_disk_image = new_status;
+                        if mounted {
+                            self.refresh_processes();
+                        }
                     }
-                    Err(error) => self.logs.push(format!(
-                        "Developer Disk Image unmount failed: {error}"
-                    )),
-                },
+                }
                 WorkerEvent::Launched(result) => match result {
                     Ok(pid) => {
                         self.manual_pid = pid.to_string();
@@ -313,44 +352,6 @@ impl DebuggerApp {
         self.selected_device
             .and_then(|index| self.devices.get(index))
             .map(|device| device.udid.clone())
-    }
-
-    fn selected_bundle_id(&self) -> Option<String> {
-        self.selected_app
-            .and_then(|index| self.filtered_apps().get(index).cloned())
-            .map(|app| app.bundle_id)
-    }
-
-    fn filtered_apps(&self) -> Vec<AppInfo> {
-        let filter = self.app_filter.trim().to_lowercase();
-        if filter.is_empty() {
-            return self.apps.clone();
-        }
-
-        self.apps
-            .iter()
-            .filter(|app| {
-                app.name.to_lowercase().contains(&filter)
-                    || app.bundle_id.to_lowercase().contains(&filter)
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn filtered_processes(&self) -> Vec<ProcessInfo> {
-        let filter = self.process_filter.trim().to_lowercase();
-        if filter.is_empty() {
-            return self.processes.clone();
-        }
-
-        self.processes
-            .iter()
-            .filter(|process| {
-                process.name.to_lowercase().contains(&filter)
-                    || process.pid.to_string().contains(&filter)
-            })
-            .cloned()
-            .collect()
     }
 
     fn refresh_scripts(&mut self) {
@@ -416,9 +417,13 @@ impl DebuggerApp {
             .unwrap_or(false)
     }
 
+    fn has_script(&self) -> bool {
+        !self.script_name.trim().is_empty()
+    }
+
     fn current_script(&self) -> Option<(String, String)> {
         let name = self.script_name.trim();
-        if name.is_empty() {
+        if !self.has_script() {
             return None;
         }
         Some((name.to_string(), self.script_source.clone()))
@@ -536,7 +541,7 @@ impl DebuggerApp {
         self.refresh_scripts();
     }
 
-    fn select_device(&mut self, index: usize) {
+    fn select_device(&mut self, index: usize, background: bool) {
         self.selected_device = Some(index);
         self.logs.clear();
         self.apps.clear();
@@ -551,6 +556,7 @@ impl DebuggerApp {
             self.send(WorkerCommand::ListApps {
                 udid: device.udid.clone(),
                 connection: device.connection,
+                background,
             });
         }
     }
@@ -559,10 +565,11 @@ impl DebuggerApp {
         self.selected_device
             .and_then(|index| self.devices.get(index))
             .map(device_label)
-            .unwrap_or_else(|| "Select a device".to_string())
+            .unwrap_or_else(|| "No device".to_string())
     }
 
     fn send(&mut self, command: WorkerCommand) {
+        let manages_disk_image = matches!(&command, WorkerCommand::ManageDeveloperDiskImage { .. });
         if matches!(
             &command,
             WorkerCommand::LaunchAndAttachAndRunScript { .. } | WorkerCommand::AttachAndRun { .. }
@@ -576,6 +583,8 @@ impl DebuggerApp {
         if self.command_tx.send(command).is_err() {
             self.script_running = false;
             self.logs.push("Worker is unavailable".to_string());
+        } else if manages_disk_image {
+            self.disk_image_pending = true;
         }
     }
 
@@ -584,6 +593,7 @@ impl DebuggerApp {
             self.send(WorkerCommand::ListApps {
                 udid: device.udid.clone(),
                 connection: device.connection,
+                background: false,
             });
         } else {
             self.logs.push("Select a device first".to_string());
@@ -605,30 +615,31 @@ impl DebuggerApp {
             return;
         }
 
-        if self.last_pid_refresh.elapsed() >= Duration::from_secs(3) {
+        if self.last_pid_refresh.elapsed() >= PROCESS_REFRESH_INTERVAL {
             self.refresh_processes();
         }
     }
 
+    fn jit_actions(&self, ui: &mut egui::Ui, has_target: bool) -> Option<JitAction> {
+        let requires_scripts = matches!(
+            &self.device_status,
+            Some(Ok(status)) if matches!(status.requires_scripts, RequiresScriptsStatus::Yes)
+        );
+        let can_stop = self.attached || self.script_running;
+        ui::device_jit_actions(ui, requires_scripts, has_target, self.has_script(), can_stop, false)
+    }
+
     fn auto_select_script_for_target(&mut self, target_name: &str) {
-        let Some(script_name) = recommended_script_for_target(target_name) else {
+        let Some(script_name) = BundledScript::recommended(target_name) else {
             return;
         };
 
-        if self.select_script_by_name(script_name) {
+        if self.select_script_by_name(script_name.name()) {
             self.logs.push(format!(
                 "Auto-selected script {} for {}",
-                script_name, target_name
+                script_name.name(), target_name
             ));
         }
-    }
-
-    fn render_status_indicator(ui: &mut egui::Ui, color: egui::Color32, text: &str) {
-        ui.horizontal(|ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-            ui.painter().circle_filled(rect.center(), 4.0, color);
-            ui.label(text);
-        });
     }
 
     fn maybe_log_livecontainer_selected(&mut self, target_name: &str) {
@@ -658,115 +669,79 @@ impl eframe::App for DebuggerApp {
         self.drain_events();
         self.maybe_refresh_processes();
 
-        egui::Panel::top("device_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Device");
-                egui::ComboBox::from_id_salt("device_selector")
-                    .selected_text(self.selected_device_label())
-                    .show_ui(ui, |ui| {
-                        if self.devices.is_empty() {
-                            ui.label("No devices found");
+        let mut chosen = None;
+        let selected_label = self.selected_device_label();
+        ui::device_bar(ui, &mut self.show_logs, |ui| {
+            egui::ComboBox::from_id_salt("device_selector")
+                .selected_text(selected_label)
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    if self.devices.is_empty() {
+                        ui.label("No devices found");
+                    }
+                    for (index, device) in self.devices.iter().enumerate() {
+                        if ui
+                            .selectable_label(
+                                self.selected_device == Some(index),
+                                device_label(device),
+                            )
+                            .clicked()
+                        {
+                            chosen = Some(index);
                         }
-                        let mut chosen = None;
-                        for (index, device) in self.devices.iter().enumerate() {
-                            if ui
-                                .selectable_label(
-                                    self.selected_device == Some(index),
-                                    device_label(device),
-                                )
-                                .clicked()
-                            {
-                                chosen = Some(index);
-                            }
-                        }
-                        if let Some(index) = chosen {
-                            self.select_device(index);
-                        }
-                    });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.toggle_value(&mut self.show_logs, "Logs");
+                    }
                 });
-            });
         });
-
-        egui::Panel::bottom("logs")
-            .resizable(true)
-            .default_size(180.0)
-            .show_collapsible(ui, &mut self.show_logs, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Log");
-                    if ui.button("Copy Logs").clicked() {
-                        ui.ctx().copy_text(self.logs.join("\n"));
-                        self.logs.push("Copied logs to clipboard".to_string());
-                    }
-                    if ui.button("Clear").clicked() {
-                        self.logs.clear();
-                    }
-                });
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(self.logs.join("\n")).monospace())
-                                .selectable(true)
-                                .wrap(),
-                        );
-                    });
-            });
+        if let Some(index) = chosen {
+            self.select_device(index, false);
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             let devices_height = 150.0;
             let top_spacing = 8.0;
 
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_min_width(960.0);
-                    ui.columns(2, |columns| {
+            ui::workspace(ui, 960.0, |columns| {
                         columns[0].vertical(|ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(ui.available_width(), devices_height),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
+                            let device = self.selected_device.and_then(|index| self.devices.get(index));
                             ui.horizontal(|ui| {
-                                ui.heading("Device Status");
-                                Self::render_status_indicator(
-                                    ui,
-                                    if self.attached {
-                                        egui::Color32::from_rgb(80, 200, 120)
-                                    } else {
-                                        egui::Color32::from_rgb(140, 140, 140)
-                                    },
-                                    "Attached",
-                                );
-                                Self::render_status_indicator(
-                                    ui,
-                                    if self.script_running {
-                                        egui::Color32::from_rgb(255, 196, 64)
-                                    } else {
-                                        egui::Color32::from_rgb(140, 140, 140)
-                                    },
-                                    "Script Running",
-                                );
-                                if matches!(self.worker_activity, WorkerActivity::Foreground) {
+                                ui.heading(device.map_or("Device Status", |device| device.name.as_str()));
+                                ui::debug_indicators(ui, self.attached, self.script_running);
+                                if matches!(self.worker_activity, WorkerActivity::Foreground { started }
+                                    if started.elapsed() >= Duration::from_millis(250))
+                                {
                                     ui.spinner();
                                 }
                             });
 
-                            if let Some(status) = &self.device_status {
-                                let is_usb = self
-                                    .selected_device
-                                    .and_then(|index| self.devices.get(index))
-                                    .is_some_and(|device| device.connection == DeviceConnection::Usb);
-                                if render_device_status(ui, status, is_usb)
-                                    && matches!(self.worker_activity, WorkerActivity::Idle)
-                                {
-                                    if let Some(udid) = self.selected_udid() {
-                                        self.send(WorkerCommand::UnmountDeveloperDiskImage {
-                                            udid,
-                                        });
-                                    }
+                            if let Some(device) = device {
+                                ui::device_identity(
+                                    ui,
+                                    device.model.as_deref(),
+                                    device.version.as_deref(),
+                                    device.build.as_deref(),
+                                    Some(&device.udid),
+                                );
+                                if let Some(version) = &device.version {
+                                    ui::device_version_warning(ui, version);
+                                }
+                            }
+                            if let (Some(status), Some(device)) = (&self.device_status, device) {
+                                let can_manage = !matches!(self.worker_activity, WorkerActivity::Foreground { .. })
+                                    && !self.disk_image_pending
+                                    && !self.attached
+                                    && !self.script_running;
+                                if let Some(action) = render_device_status(
+                                    ui, status, device.connection == DeviceConnection::Usb, can_manage,
+                                ) {
+                                    self.send(WorkerCommand::ManageDeveloperDiskImage {
+                                        udid: device.udid.clone(),
+                                        connection: device.connection,
+                                        action,
+                                    });
                                 }
                             }
                         },
@@ -783,88 +758,31 @@ impl eframe::App for DebuggerApp {
                                 egui::vec2(left_width, lower_left_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.heading("Apps");
-                                        if ui.button("Refresh").clicked() {
-                                            self.refresh_selected_device_lists();
-                                        }
-                                    });
-                                    ui.label("Only apps with get-task-allow are shown.");
-                                    ui.horizontal(|ui| {
-                                        ui.label("Filter");
-                                        ui.text_edit_singleline(&mut self.app_filter);
-                                    });
-
-                                    let actions_height = 34.0;
-                                    let apps_list_height = (ui.available_height() - actions_height).max(120.0);
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("apps")
-                                        .max_height(apps_list_height)
-                                        .show(ui, |ui| {
-                                            let apps = self.filtered_apps();
-                                            for (index, app) in apps.iter().enumerate() {
-                                                let selected = self.selected_app == Some(index);
-                                                if ui.selectable_label(selected, &app.name).clicked() {
-                                                    self.selected_app = Some(index);
-                                                    self.auto_select_script_for_target(&app.name);
-                                                    self.maybe_log_livecontainer_selected(&app.name);
-                                                }
-                                                ui.small(&app.bundle_id);
-                                                ui.add_space(4.0);
-                                            }
-                                        });
-
-                                    let can_launch = self.selected_udid().is_some()
-                                        && self.selected_bundle_id().is_some();
-                                    let can_launch_and_run =
-                                        can_launch && self.current_script().is_some();
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                can_launch,
-                                                egui::Button::new("Enable JIT"),
-                                            )
-                                            .clicked()
-                                        {
-                                            if let (Some(udid), Some(bundle_id)) =
-                                                (self.selected_udid(), self.selected_bundle_id())
-                                            {
-                                                self.send(WorkerCommand::LaunchAndAttach {
-                                                    udid,
-                                                    bundle_id,
-                                                });
+                                    if ui::list_heading(ui, "Apps", true) {
+                                        self.refresh_selected_device_lists();
+                                    }
+                                    let list_height = (ui.available_height() - 92.0).max(120.0);
+                                    if let Some(app) = ui::app_list(ui, &self.apps, self.selected_app.as_deref(), &mut self.app_filter, list_height) {
+                                        let name = app.name.clone();
+                                        self.selected_app = Some(app.bundle_id.clone());
+                                        self.auto_select_script_for_target(&name);
+                                        self.maybe_log_livecontainer_selected(&name);
+                                    }
+                                    let target = self.selected_udid().zip(self.selected_app.clone());
+                                    match self.jit_actions(ui, target.is_some()) {
+                                        Some(JitAction::Enable) => {
+                                            if let Some((udid, bundle_id)) = target {
+                                                self.send(WorkerCommand::LaunchAndAttach { udid, bundle_id });
                                             }
                                         }
-                                        if ui
-                                            .add_enabled(
-                                                can_launch_and_run,
-                                                egui::Button::new("Enable JIT via Script"),
-                                            )
-                                            .clicked()
-                                        {
-                                            if let (Some(udid), Some(bundle_id), Some((name, source))) = (
-                                                self.selected_udid(),
-                                                self.selected_bundle_id(),
-                                                self.current_script(),
-                                            ) {
-                                                self.send(WorkerCommand::LaunchAndAttachAndRunScript {
-                                                    udid,
-                                                    bundle_id,
-                                                    name,
-                                                    source,
-                                                });
+                                        Some(JitAction::RunScript) => {
+                                            if let (Some((udid, bundle_id)), Some((name, source))) = (target, self.current_script()) {
+                                                self.send(WorkerCommand::LaunchAndAttachAndRunScript { udid, bundle_id, name, source });
                                             }
                                         }
-                                        if ui
-                                            .add_enabled(
-                                                self.attached || self.script_running,
-                                                egui::Button::new("Stop"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.send(WorkerCommand::Stop);
-                                        }
-                                    });
+                                        Some(JitAction::Stop) => self.send(WorkerCommand::Stop),
+                                        None => {}
+                                    }
                                 },
                             );
                             ui.separator();
@@ -873,107 +791,35 @@ impl eframe::App for DebuggerApp {
                                 egui::vec2(pid_width, lower_left_height),
                                 egui::Layout::top_down(egui::Align::Min),
                                 |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.heading("PID");
-                                        if ui.button("Refresh").clicked() {
-                                            self.refresh_selected_device_lists();
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Filter");
-                                        ui.text_edit_singleline(&mut self.process_filter);
-                                    });
-                                    let process_list_height = (ui.available_height() - 84.0).max(80.0);
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("processes")
-                                        .max_height(process_list_height)
-                                        .show(ui, |ui| {
-                                            for process in self.filtered_processes() {
-                                                let selected = self.selected_process == Some(process.pid);
-                                                if ui
-                                                    .selectable_label(
-                                                        selected,
-                                                        format!("{} ({})", process.name, process.pid),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.selected_process = Some(process.pid);
-                                                    self.manual_pid = process.pid.to_string();
-                                                    self.auto_select_script_for_target(&process.name);
-                                                    self.maybe_log_livecontainer_selected(&process.name);
-                                                }
-                                            }
-                                        });
-
-                                    ui.horizontal(|ui| {
-                                        ui.label("PID");
-                                        let response = ui.text_edit_singleline(&mut self.manual_pid);
-                                        if response.changed() {
-                                            self.selected_process =
-                                                self.manual_pid.trim().parse::<u32>().ok();
-                                        }
-                                    });
-
-                                    let parsed_pid = self.manual_pid.trim().parse::<u32>().ok();
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui
-                                            .add_enabled(
-                                                self.selected_udid().is_some() && parsed_pid.is_some(),
-                                                egui::Button::new("Enable JIT"),
-                                            )
-                                            .clicked()
-                                        {
-                                            match (self.selected_udid(), parsed_pid) {
-                                                (Some(udid), Some(pid)) => {
-                                                    self.send(WorkerCommand::Attach { udid, pid })
-                                                }
-                                                (None, _) => {
-                                                    self.logs.push("Select a device first".to_string())
-                                                }
-                                                (_, None) => self.logs.push("Enter a numeric PID".to_string()),
+                                    if ui::list_heading(ui, "PID", true) {
+                                        self.refresh_selected_device_lists();
+                                    }
+                                    let list_height = (ui.available_height() - 115.0).max(80.0);
+                                    if let Some(process) = ui::process_list(ui, &self.processes, self.selected_process, &mut self.process_filter, list_height) {
+                                        let name = process.name.clone();
+                                        self.selected_process = Some(process.pid);
+                                        self.manual_pid = process.pid.to_string();
+                                        self.auto_select_script_for_target(&name);
+                                        self.maybe_log_livecontainer_selected(&name);
+                                    }
+                                    if ui::pid_field(ui, &mut self.manual_pid) {
+                                        self.selected_process = ui::parse_pid(&self.manual_pid);
+                                    }
+                                    let target = self.selected_udid().zip(ui::parse_pid(&self.manual_pid));
+                                    match self.jit_actions(ui, target.is_some()) {
+                                        Some(JitAction::Enable) => {
+                                            if let Some((udid, pid)) = target {
+                                                self.send(WorkerCommand::Attach { udid, pid });
                                             }
                                         }
-
-                                        if ui
-                                            .add_enabled(
-                                                self.selected_udid().is_some()
-                                                    && parsed_pid.is_some()
-                                                    && self.current_script().is_some(),
-                                                egui::Button::new("Enable JIT via Script"),
-                                            )
-                                            .clicked()
-                                        {
-                                            match (self.selected_udid(), parsed_pid, self.current_script()) {
-                                                (Some(udid), Some(pid), Some((name, source))) => {
-                                                    self.send(WorkerCommand::AttachAndRun {
-                                                        udid,
-                                                        pid,
-                                                        name,
-                                                        source,
-                                                    });
-                                                }
-                                                (None, _, _) => {
-                                                    self.logs.push("Select a device first".to_string())
-                                                }
-                                                (_, None, _) => {
-                                                    self.logs.push("Enter a numeric PID".to_string())
-                                                }
-                                                (_, _, None) => self
-                                                    .logs
-                                                    .push("Select or name a script first".to_string()),
+                                        Some(JitAction::RunScript) => {
+                                            if let (Some((udid, pid)), Some((name, source))) = (target, self.current_script()) {
+                                                self.send(WorkerCommand::AttachAndRun { udid, pid, name, source });
                                             }
                                         }
-
-                                        if ui
-                                            .add_enabled(
-                                                self.attached || self.script_running,
-                                                egui::Button::new("Stop"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.send(WorkerCommand::Stop);
-                                        }
-                                    });
+                                        Some(JitAction::Stop) => self.send(WorkerCommand::Stop),
+                                        None => {}
+                                    }
                                 },
                             );
                         },
@@ -981,12 +827,7 @@ impl eframe::App for DebuggerApp {
                 });
 
                         columns[1].vertical(|ui| {
-                    let script_height = ui.available_height().clamp(120.0, 340.0);
-
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), script_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
+                        ui::script_section(ui, self.show_logs, |ui| {
                             ui.horizontal(|ui| {
                                 ui.heading("Scripts");
                                 if ui
@@ -1008,37 +849,9 @@ impl eframe::App for DebuggerApp {
                             ui.label("Select a bundled script or import your own .js file.");
                             ui.label("Scripts are required to enable JIT on TXM (A15+/M2+ chip) devices running iOS 26+.");
 
-                            ui.add_enabled_ui(!self.script_running, |ui| {
-                                let popup_max_height =
-                                    (ui.ctx().content_rect().bottom() - ui.next_widget_position().y
-                                        - 16.0)
-                                        .max(120.0);
-                                egui::ComboBox::from_label("Selected Script")
-                                    .height(popup_max_height)
-                                    .selected_text(
-                                        self.selected_script
-                                            .and_then(|index| self.script_entries.get(index))
-                                            .map(|entry| entry.name.clone())
-                                            .unwrap_or_else(|| "No script selected".to_string()),
-                                    )
-                                    .show_ui(ui, |ui| {
-                                        let mut chosen = None;
-                                        for (index, entry) in self.script_entries.iter().enumerate() {
-                                            if ui
-                                                .selectable_label(
-                                                    self.selected_script == Some(index),
-                                                    &entry.name,
-                                                )
-                                                .clicked()
-                                            {
-                                                chosen = Some(index);
-                                            }
-                                        }
-                                        if let Some(index) = chosen {
-                                            self.load_script(index);
-                                        }
-                                    });
-                            });
+                            if let Some(index) = ui::script_picker(ui, !self.script_running, self.selected_script, self.script_entries.iter().map(|entry| entry.name.as_str())) {
+                                self.load_script(index);
+                            }
                             if self.script_running {
                                 ui.small("Script switching is disabled while a script is running.");
                             }
@@ -1047,12 +860,12 @@ impl eframe::App for DebuggerApp {
                             } else {
                                 ui.small("Built-in scripts cannot be deleted.");
                             }
-                        },
-                    );
-
                         });
-                    });
-                });
+                        if self.show_logs {
+                            ui::logs(ui, &mut self.logs);
+                        }
+                        });
+            });
         });
 
         ui.ctx()
@@ -1061,165 +874,92 @@ impl eframe::App for DebuggerApp {
 }
 
 fn device_label(device: &DeviceInfo) -> String {
-    format!("{} ({})", device.name, device.connection.label())
+    let transport = match device.connection {
+        DeviceConnection::Network => "Wi-Fi",
+        connection => connection.label(),
+    };
+    format!("{} · {transport}", device.name)
+}
+
+fn render_device_check(ui: &mut egui::Ui, label: &str, status: &CheckStatus, disabled: &str) {
+    ui::device_check(ui, label, |ui| match status {
+        CheckStatus::Checking | CheckStatus::Downloading => {
+            ui.weak("Checking");
+        }
+        CheckStatus::Success => ui::device_check_value(ui, Some(true), disabled),
+        CheckStatus::Disabled => ui::device_check_value(ui, Some(false), disabled),
+        CheckStatus::Failed(error) => {
+            ui.label(egui::RichText::new("Failed").color(ui.visuals().error_fg_color))
+                .on_hover_text(error);
+        }
+    });
 }
 
 fn render_device_status(
     ui: &mut egui::Ui,
     status: &Result<DeviceStatus, String>,
     is_usb: bool,
-) -> bool {
-    let mut unmount_requested = false;
-    match status {
-        Ok(status) => {
-            if is_usb {
-                ui.horizontal(|ui| {
-                    ui.label("Wireless Debugging:");
-                    match &status.wireless_debugging {
-                        CheckStatus::Checking | CheckStatus::Downloading => {
-                            ui.label("Checking");
-                        }
-                        CheckStatus::Success => {
-                            ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
-                        }
-                        CheckStatus::Disabled => {
-                            ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
-                        }
-                        CheckStatus::Failed(e) => {
-                            ui.label(
-                                egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
-                            );
-                        }
-                    }
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.label("Developer Mode:");
-                match &status.developer_mode {
-                    CheckStatus::Checking | CheckStatus::Downloading => {
-                        ui.label("Checking");
-                    }
-                    CheckStatus::Success => {
-                        ui.label(egui::RichText::new("Enabled").color(egui::Color32::from_rgb(80, 200, 80)));
-                    }
-                    CheckStatus::Disabled => {
-                        ui.label(egui::RichText::new("Disabled").color(egui::Color32::RED));
-                    }
-                    CheckStatus::Failed(e) => {
-                        ui.label(
-                            egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
-                        );
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Developer Disk Image:");
-                match &status.developer_disk_image {
-                    CheckStatus::Checking => {
-                        ui.label("Checking");
-                    }
-                    CheckStatus::Downloading => {
-                        ui.label("Downloading");
-                    }
-                    CheckStatus::Success => {
-                        let response = ui
-                            .add(
-                                egui::Label::new(
-                                    egui::RichText::new("Mounted")
-                                        .color(egui::Color32::from_rgb(80, 200, 80)),
-                                )
-                                .sense(egui::Sense::click()),
-                            );
-                        unmount_requested = response.clicked()
-                            && ui.input(|input| input.modifiers.shift);
-                    }
-                    CheckStatus::Disabled => {
-                        ui.label(
-                            egui::RichText::new("Unmounted (Disabled)").color(egui::Color32::RED),
-                        );
-                    }
-                    CheckStatus::Failed(e) => {
-                        ui.label(
-                            egui::RichText::new(format!("Failed: {e}")).color(egui::Color32::RED),
-                        );
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Requires Scripts:");
-                match &status.requires_scripts {
-                    RequiresScriptsStatus::Checking => {
-                        ui.label("Checking");
-                    }
-                    RequiresScriptsStatus::Yes => {
-                        ui.label(
-                            egui::RichText::new("Yes (TXM device on iOS 26+)")
-                                .color(egui::Color32::from_rgb(80, 200, 80)),
-                        );
-                    }
-                    RequiresScriptsStatus::No(reason) => {
-                        ui.label(
-                            egui::RichText::new(format!("No ({reason})"))
-                                .color(egui::Color32::from_rgb(80, 200, 80)),
-                        );
-                    }
-                    RequiresScriptsStatus::Unknown(e) => {
-                        ui.label(
-                            egui::RichText::new(format!("Unknown: {e}"))
-                                .color(egui::Color32::RED),
-                        );
-                    }
-                }
-            });
-        }
+    can_manage: bool,
+) -> Option<DiskImageAction> {
+    let status = match status {
+        Ok(status) => status,
         Err(error) => {
-            if error == "Device Locked" {
-                ui.label(egui::RichText::new("Device Locked").color(egui::Color32::RED));
-                return false;
-            }
-            if is_usb {
-                ui.horizontal(|ui| {
-                    ui.label("Wireless Debugging:");
-                    ui.label(
-                        egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED),
-                    );
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.label("Developer Mode:");
-                ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Developer Disk Image:");
-                ui.label(egui::RichText::new(format!("Failed: {error}")).color(egui::Color32::RED));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Requires Scripts:");
-                ui.label(
-                    egui::RichText::new(format!("Unknown: {error}"))
-                        .color(egui::Color32::RED),
-                );
-            });
+            ui.label(egui::RichText::new(error).color(ui.visuals().error_fg_color));
+            return None;
         }
+    };
+    if is_usb {
+        render_device_check(ui, "Wireless debugging", &status.wireless_debugging, "Off");
     }
-    unmount_requested
+    render_device_check(ui, "Developer mode", &status.developer_mode, "Disabled");
+    let mut disk_image_action = None;
+    ui::device_check(ui, "Developer disk image", |ui| {
+        match &status.developer_disk_image {
+            CheckStatus::Checking => {
+                ui.label("Checking");
+            }
+            CheckStatus::Downloading => {
+                ui.label("Downloading");
+            }
+            CheckStatus::Success => {
+                if ui::mounted_ddi_label(ui) && can_manage {
+                    disk_image_action = Some(DiskImageAction::Unmount);
+                }
+            }
+            CheckStatus::Disabled => {
+                ui.label(egui::RichText::new("Unmounted").color(ui.visuals().warn_fg_color));
+            }
+            CheckStatus::Failed(e) => {
+                ui.label(
+                    egui::RichText::new("Mount failed").color(ui.visuals().error_fg_color),
+                ).on_hover_text(e);
+            }
+        }
+        if matches!(
+            status.developer_disk_image,
+            CheckStatus::Disabled | CheckStatus::Failed(_)
+        ) && ui
+            .add_enabled(
+                can_manage && !matches!(status.developer_mode, CheckStatus::Disabled),
+                egui::Button::new("Mount"),
+            )
+            .clicked()
+        {
+            disk_image_action = Some(DiskImageAction::Mount);
+        }
+    });
+    ui::requires_scripts_status(ui, &status.requires_scripts);
+    disk_image_action
 }
 
 
-const BUNDLED_SCRIPTS: [(&str, &str); 4] = [
-    ("Geode.js", include_str!("../scripts/Geode.js")),
-    ("maciOS.js", include_str!("../scripts/maciOS.js")),
-    ("universal.js", include_str!("../scripts/universal.js")),
-    ("legacy.js", include_str!("../scripts/legacy.js")),
-];
-
 fn read_script_entries(dir: &Path) -> std::io::Result<Vec<ScriptEntry>> {
-    let mut entries = BUNDLED_SCRIPTS
-        .iter()
-        .map(|(name, source)| ScriptEntry {
+    let mut entries = BundledScript::ALL
+        .into_iter()
+        .map(|script| ScriptEntry {
             editable: false,
-            name: (*name).to_string(),
-            location: ScriptLocation::Bundled(source),
+            name: script.name().to_owned(),
+            location: ScriptLocation::Bundled(script.source()),
         })
         .collect::<Vec<_>>();
 
@@ -1307,39 +1047,6 @@ fn app_support_dir() -> PathBuf {
 }
 
 fn is_built_in_script_name(name: &str) -> bool {
-    matches!(
-        script_name_key(name).as_str(),
-        "geode" | "macios" | "universal" | "legacy"
-    )
-}
-
-fn script_name_key(name: &str) -> String {
-    let stem = Path::new(name)
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(name);
-    stem.chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect()
-}
-
-const DEFAULT_SCRIPT_NAME: &str = "universal.js";
-const MACIOS_SCRIPT_NAME: &str = "maciOS.js";
-const GEODE_SCRIPT_NAME: &str = "Geode.js";
-const UNIVERSAL_SCRIPT_NAME: &str = "universal.js";
-const UTM_SCRIPT_NAME: &str = "legacy.js";
-
-fn recommended_script_for_target(target_name: &str) -> Option<&'static str> {
-    let key = script_name_key(target_name);
-    match key.as_str() {
-        "macios" => Some(MACIOS_SCRIPT_NAME),
-        "amethyst" | "melonx" | "xenios" | "melocafe" | "manic emu" | "dukex"
-        | "applesauce" | "rpcs3" | "aetherps4" => {
-            Some(UNIVERSAL_SCRIPT_NAME)
-        }
-        "geode" => Some(GEODE_SCRIPT_NAME),
-        "utm" | "dolphinios" | "flycast" | "armsx2" | "armsx2ios" => Some(UTM_SCRIPT_NAME),
-        _ => None,
-    }
+    let key = script_name_key(name);
+    BundledScript::ALL.into_iter().any(|script| script_name_key(script.name()) == key)
 }
