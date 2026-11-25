@@ -1,3 +1,6 @@
+use crate::device_services::{self, DDI_FILES, RequiresScriptsStatus, configure_no_ack_mode, connect_rsd, ddi_asset_url, ddi_directory, launch_application};
+use crate::targets::{self, AppInfo, ProcessInfo};
+
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -6,6 +9,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -13,13 +17,11 @@ use futures::StreamExt;
 use idevice::{
     IdeviceError, IdeviceService, ReadWrite, RsdService,
     core_device::AppServiceClient,
-    core_device_proxy::CoreDeviceProxy,
-    cryptexd::{Cryptex1Assets, CryptexdClient, install_ddi, installed_ddi},
+    cryptexd::{Cryptex1Assets, install_ddi, installed_ddi},
     debug_proxy::{DebugProxyClient, DebugserverCommand},
     installation_proxy::InstallationProxyClient,
     mobile_image_mounter::ImageMounter,
     provider::{IdeviceProvider, UsbmuxdProvider},
-    rsd::RsdHandshake,
     services::lockdown::LockdownClient,
     tcp::handle::AdapterHandle,
     usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection},
@@ -30,18 +32,13 @@ use crate::scripts;
 
 const LABEL: &str = "JITserver";
 
-const DDI_FILES: [&str; 5] = [
-    "BuildManifest.plist",
-    "Image.dmg",
-    "Image.dmg.trustcache",
-    "Image.dmg.cryptex_info",
-    "Image.dmg.root_hash",
-];
-
 #[derive(Clone, Debug, Default)]
 pub struct DeviceInfo {
     pub udid: String,
     pub name: String,
+    pub model: Option<String>,
+    pub version: Option<String>,
+    pub build: Option<String>,
     pub connection: DeviceConnection,
 }
 
@@ -51,32 +48,6 @@ pub enum DeviceConnection {
     Network,
     #[default]
     Other,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct AppInfo {
-    pub bundle_id: String,
-    pub name: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ProcessInfo {
-    pub pid: u32,
-    pub name: String,
-}
-
-#[derive(Clone, Debug)]
-pub enum RequiresScriptsStatus {
-    Checking,
-    Yes,
-    No(String),
-    Unknown(String),
-}
-
-impl Default for RequiresScriptsStatus {
-    fn default() -> Self {
-        Self::Checking
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -102,17 +73,26 @@ impl Default for CheckStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum DiskImageAction {
+    Mount,
+    Unmount,
+}
+
 #[derive(Debug)]
 pub enum WorkerCommand {
     ListApps {
         udid: String,
         connection: DeviceConnection,
+        background: bool,
     },
     ListProcesses {
         udid: String,
     },
-    UnmountDeveloperDiskImage {
+    ManageDeveloperDiskImage {
         udid: String,
+        connection: DeviceConnection,
+        action: DiskImageAction,
     },
     LaunchAndAttach {
         udid: String,
@@ -141,7 +121,7 @@ pub enum WorkerCommand {
 pub enum WorkerActivity {
     Idle,
     Background,
-    Foreground,
+    Foreground { started: Instant },
 }
 
 #[derive(Debug)]
@@ -155,7 +135,12 @@ pub enum WorkerEvent {
     },
     Apps(Result<Vec<AppInfo>, String>),
     Processes(Result<Vec<ProcessInfo>, String>),
-    DeveloperDiskImageUnmounted(Result<(), String>),
+    DeveloperDiskImage {
+        udid: String,
+        connection: DeviceConnection,
+        action: DiskImageAction,
+        result: Result<(), String>,
+    },
     Launched(Result<u32, String>),
     Attached(Result<String, String>),
     DebugResponse(Result<String, String>),
@@ -189,8 +174,9 @@ pub fn spawn_worker() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerEven
 
         while let Ok(command) = command_rx.recv() {
             let activity = match &command {
-                WorkerCommand::ListProcesses { .. } => WorkerActivity::Background,
-                _ => WorkerActivity::Foreground,
+                WorkerCommand::ListProcesses { .. }
+                | WorkerCommand::ListApps { background: true, .. } => WorkerActivity::Background,
+                _ => WorkerActivity::Foreground { started: Instant::now() },
             };
             let _ = worker.event_tx.send(WorkerEvent::Activity(activity));
             runtime.block_on(worker.handle(command));
@@ -211,7 +197,7 @@ struct DeviceWorker {
 impl DeviceWorker {
     async fn handle(&mut self, command: WorkerCommand) {
         match command {
-            WorkerCommand::ListApps { udid, connection } => {
+            WorkerCommand::ListApps { udid, connection, .. } => {
                 inspect_device_status(&udid, connection, &self.event_tx).await;
                 let result = list_apps(&udid).await.map_err(format_error);
                 let _ = self.event_tx.send(WorkerEvent::Apps(result));
@@ -222,21 +208,38 @@ impl DeviceWorker {
                 let processes = list_processes(&udid).await.map_err(format_error);
                 let _ = self.event_tx.send(WorkerEvent::Processes(processes));
             }
-            WorkerCommand::UnmountDeveloperDiskImage { udid } => {
-                let result = unmount_developer_disk_image(&udid)
-                    .await
-                    .map_err(format_error);
-                let _ = self
-                    .event_tx
-                    .send(WorkerEvent::DeveloperDiskImageUnmounted(result));
+            WorkerCommand::ManageDeveloperDiskImage {
+                udid,
+                connection,
+                action,
+            } => {
+                let result = async {
+                    let provider = provider_for_udid_with_connection(&udid, connection).await?;
+                    match action {
+                        DiskImageAction::Mount => {
+                            ensure_developer_disk_image(&provider, true, || {}).await?;
+                        }
+                        DiskImageAction::Unmount => {
+                            let (version, _) = ddi_device_info(&provider).await?;
+                            device_services::unmount_ddi(&provider, &version).await?;
+                        }
+                    }
+                    Ok(())
+                }
+                .await
+                .map_err(format_error);
+                let _ = self.event_tx.send(WorkerEvent::DeveloperDiskImage {
+                    udid,
+                    connection,
+                    action,
+                    result,
+                });
             }
             WorkerCommand::LaunchAndAttach { udid, bundle_id } => {
                 let result = async {
                     let pid = launch_app(&udid, &bundle_id, true).await?;
                     let session = attach_debugger(&udid, pid).await?;
-                    let attach_response =
-                        send_debug_command(&session, format!("vAttach;{pid:x}")).await?;
-                    let detach_response = send_debug_command(&session, "D").await?;
+                    let (attach_response, detach_response) = attach_and_detach(&session).await?;
                     Ok((pid, attach_response, detach_response))
                 }
                 .await
@@ -289,13 +292,19 @@ impl DeviceWorker {
             WorkerCommand::Attach { udid, pid } => {
                 let result = async {
                     let session = attach_debugger(&udid, pid).await?;
-                    let response = send_debug_command(&session, format!("vAttach;{pid:x}")).await?;
-                    self.active_debug = Some(session);
-                    Ok(response)
+                    attach_and_detach(&session).await
                 }
                 .await
                 .map_err(format_error);
-                let _ = self.event_tx.send(WorkerEvent::Attached(result));
+                match result {
+                    Ok((attach_response, detach_response)) => {
+                        let _ = self.event_tx.send(WorkerEvent::Attached(Ok(attach_response)));
+                        let _ = self.event_tx.send(WorkerEvent::DebugResponse(Ok(detach_response)));
+                    }
+                    Err(error) => {
+                        let _ = self.event_tx.send(WorkerEvent::Attached(Err(error)));
+                    }
+                }
             }
             WorkerCommand::AttachAndRun {
                 udid,
@@ -420,11 +429,29 @@ async fn refresh_devices() -> Result<Vec<DeviceInfo>> {
 
     for device in devices {
         let provider = device.to_provider(UsbmuxdAddr::default(), LABEL);
+        let mut model = None;
+        let mut version = None;
+        let mut build = None;
         let name = match LockdownClient::connect(&provider).await {
             Ok(mut lockdown) => {
                 if let Ok(pairing_file) = provider.get_pairing_file().await {
                     let _ = lockdown.start_session(&pairing_file).await;
                 }
+                version = lockdown
+                    .get_value(Some("ProductVersion"), None)
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_string().map(ToOwned::to_owned));
+                model = lockdown
+                    .get_value(Some("ProductType"), None)
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_string().map(ToOwned::to_owned));
+                build = lockdown
+                    .get_value(Some("BuildVersion"), None)
+                    .await
+                    .ok()
+                    .and_then(|value| value.as_string().map(ToOwned::to_owned));
                 lockdown
                     .get_value(Some("DeviceName"), None)
                     .await
@@ -438,6 +465,9 @@ async fn refresh_devices() -> Result<Vec<DeviceInfo>> {
         infos.push(DeviceInfo {
             udid: device.udid,
             name,
+            model,
+            version,
+            build,
             connection: DeviceConnection::from(&device.connection_type),
         });
     }
@@ -449,30 +479,7 @@ async fn list_apps(udid: &str) -> Result<Vec<AppInfo>> {
     let provider = provider_for_udid(udid).await?;
     let mut client = InstallationProxyClient::connect(&provider).await?;
     let apps = client.get_apps(Some("Any"), None).await?;
-    let mut infos = apps
-        .into_iter()
-        .filter(|(_, value)| has_get_task_allow(value))
-        .map(|(bundle_id, value)| {
-            let dictionary = value.as_dictionary();
-            let name = dictionary
-                .and_then(|dict| {
-                    dict.get("CFBundleDisplayName")
-                        .or_else(|| dict.get("CFBundleName"))
-                        .and_then(|value| value.as_string())
-                })
-                .unwrap_or(&bundle_id)
-                .to_string();
-            AppInfo { bundle_id, name }
-        })
-        .collect::<Vec<_>>();
-
-    infos.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then(a.bundle_id.cmp(&b.bundle_id))
-    });
-    Ok(infos)
+    Ok(targets::debuggable_apps(apps))
 }
 
 async fn inspect_device_status(
@@ -536,17 +543,7 @@ async fn inspect_device_status(
     send_status(Ok(status.clone()));
 
     status.requires_scripts = match check_requires_scripts(&provider).await {
-        Ok((true, true)) => RequiresScriptsStatus::Yes,
-        Ok((has_txm, is_ios_26)) => {
-            let mut reasons = Vec::new();
-            if !has_txm {
-                reasons.push("No TXM Detected");
-            }
-            if !is_ios_26 {
-                reasons.push("Not Running iOS 26+");
-            }
-            RequiresScriptsStatus::No(reasons.join(", "))
-        }
+        Ok(status) => status,
         Err(error) if is_device_locked(&error) => {
             send_status(Err("Device Locked".to_string()));
             return;
@@ -571,63 +568,6 @@ fn device_status_error(error: anyhow::Error) -> String {
     } else {
         format_error(error)
     }
-}
-
-fn has_txm_hardware(product_type: &str, is_ios_27_or_newer: bool) -> bool {
-    // On iOS 27+, every device has TXM except these two non-TXM iPad models.
-    if is_ios_27_or_newer {
-        return product_type != "iPad8,11" && product_type != "iPad8,12";
-    }
-
-    let num_start = match product_type.find(|c: char| c.is_ascii_digit()) {
-        Some(i) => i,
-        None => return false,
-    };
-    let prefix = product_type[..num_start].to_lowercase();
-    let nums = &product_type[num_start..];
-    let (major_str, rest) = match nums.split_once(',') {
-        Some(pair) => pair,
-        None => return false,
-    };
-    let minor_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let major: u32 = match major_str.parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let minor: u32 = match minor_str.parse() {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    match prefix.as_str() {
-        // A15 Bionic = iPhone14,2 (iPhone 13 Pro); anything higher also has TXM
-        "iphone" => major > 14 || (major == 14 && minor >= 2),
-        // M2 iPad = iPad14,5; anything higher also has TXM
-        "ipad" => major > 14 || (major == 14 && minor >= 5),
-        _ => false,
-    }
-}
-
-fn ios_major_version(product_version: &str) -> Option<u32> {
-    product_version
-        .split('.')
-        .next()
-        .and_then(|s| s.parse::<u32>().ok())
-}
-
-fn is_ios_26_or_newer(product_version: &str) -> bool {
-    ios_major_version(product_version).is_some_and(|major| major >= 26)
-}
-
-fn is_ios_27_or_newer(product_version: &str) -> bool {
-    ios_major_version(product_version).is_some_and(|major| major >= 27)
-}
-
-fn uses_cryptex_ddi(product_version: &str) -> bool {
-    let mut parts = product_version.split('.');
-    let major = parts.next().and_then(|part| part.parse::<u32>().ok());
-    let minor = parts.next().and_then(|part| part.parse::<u32>().ok());
-    matches!((major, minor), (Some(major), _) if major > 26)
-        || matches!((major, minor), (Some(26), Some(minor)) if minor >= 4)
 }
 
 async fn ddi_device_info(provider: &UsbmuxdProvider) -> Result<(String, String)> {
@@ -662,24 +602,6 @@ async fn unique_chip_id(provider: &UsbmuxdProvider) -> Result<u64> {
         .context("missing UniqueChipID")
 }
 
-fn ddi_directory(version: &str, product_type: &str) -> Result<(&'static str, bool)> {
-    let cryptex = uses_cryptex_ddi(version);
-    anyhow::ensure!(
-        product_type.starts_with("iPhone")
-            || product_type.starts_with("iPad")
-            || product_type.starts_with("iPod")
-            || product_type.starts_with("AppleTV"),
-        "unsupported device type: {product_type}"
-    );
-    let directory = match (product_type.starts_with("AppleTV"), cryptex) {
-        (false, false) => "Xcode_iOS_DDI_Personalized",
-        (false, true) => "Xcode_iOS_DDI_Cryptex",
-        (true, false) => "Xcode_tvOS_DDI_Personalized",
-        (true, true) => "Xcode_tvOS_DDI_Cryptex",
-    };
-    Ok((directory, cryptex))
-}
-
 fn ddi_cache_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     let base = PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?);
@@ -712,9 +634,7 @@ async fn cached_ddi(directory: &str, cryptex: bool, on_download: impl FnOnce()) 
         if let Some(callback) = on_download.take() {
             callback();
         }
-        let url = format!(
-            "https://raw.githubusercontent.com/doronz88/DeveloperDiskImage/main/PersonalizedImages/{directory}/{name}"
-        );
+        let url = ddi_asset_url(directory, name);
         let mut response = client.get(url).send().await?.error_for_status()?;
         let partial = path.join(format!("{name}.part"));
         let mut file = tokio::fs::File::create(&partial).await?;
@@ -734,25 +654,12 @@ async fn cached_ddi(directory: &str, cryptex: bool, on_download: impl FnOnce()) 
     Ok(path)
 }
 
-async fn check_requires_scripts(provider: &UsbmuxdProvider) -> Result<(bool, bool)> {
+async fn check_requires_scripts(provider: &UsbmuxdProvider) -> Result<RequiresScriptsStatus> {
     let mut lockdown = LockdownClient::connect(provider).await?;
     if let Ok(pairing_file) = provider.get_pairing_file().await {
         let _ = lockdown.start_session(&pairing_file).await;
     }
-    let product_type = lockdown
-        .get_value(Some("ProductType"), None)
-        .await?
-        .as_string()
-        .map(ToOwned::to_owned)
-        .unwrap_or_default();
-    let product_version = lockdown
-        .get_value(Some("ProductVersion"), None)
-        .await?
-        .as_string()
-        .map(ToOwned::to_owned)
-        .unwrap_or_default();
-    let has_txm = has_txm_hardware(&product_type, is_ios_27_or_newer(&product_version));
-    Ok((has_txm, is_ios_26_or_newer(&product_version)))
+    Ok(device_services::check_requires_scripts(&mut lockdown).await?)
 }
 
 async fn enable_wireless_debugging(provider: &UsbmuxdProvider) -> Result<bool> {
@@ -781,7 +688,8 @@ async fn ensure_developer_disk_image(
     on_download: impl FnOnce(),
 ) -> Result<bool> {
     let (version, product_type) = ddi_device_info(provider).await?;
-    let (directory, cryptex) = ddi_directory(&version, &product_type)?;
+    let (directory, cryptex) = ddi_directory(&version, &product_type)
+        .with_context(|| format!("unsupported device type: {product_type}"))?;
     let path = cached_ddi(directory, cryptex, on_download).await?;
     if !can_mount {
         return Ok(false);
@@ -821,25 +729,6 @@ async fn ensure_developer_disk_image(
     Ok(true)
 }
 
-async fn unmount_developer_disk_image(udid: &str) -> Result<()> {
-    let provider = provider_for_udid(udid).await?;
-    let (version, _) = ddi_device_info(&provider).await?;
-    let (mut adapter, mut handshake) = connect_rsd(&provider).await?;
-    if !uses_cryptex_ddi(&version) {
-        let mut mounter = ImageMounter::connect_rsd(&mut adapter, &mut handshake).await?;
-        mounter.unmount_image("/System/Developer").await?;
-        return Ok(());
-    }
-    let installed = installed_ddi(&mut adapter, &mut handshake)
-        .await?
-        .context("developer disk image cryptex is not mounted")?;
-    let client = CryptexdClient::connect_rsd(&mut adapter, &mut handshake).await?;
-    client
-        .uninstall(&installed.identifier, Some(&installed.version))
-        .await?;
-    Ok(())
-}
-
 async fn load_ddi_bundle(path: &Path) -> Result<Cryptex1Assets> {
     let manifest: plist::Dictionary =
         plist::from_bytes(&tokio::fs::read(path.join("BuildManifest.plist")).await?)?;
@@ -867,41 +756,7 @@ async fn list_processes(udid: &str) -> Result<Vec<ProcessInfo>> {
         .list_processes()
         .await
         .context("process listing: invoke com.apple.coredevice.feature.listprocesses")?;
-    let mut infos = processes
-        .into_iter()
-        .map(|process| ProcessInfo {
-            pid: process.pid,
-            name: process_name(&process),
-        })
-        .collect::<Vec<_>>();
-
-    infos.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then(a.pid.cmp(&b.pid))
-    });
-    Ok(infos)
-}
-
-fn process_name(process: &idevice::core_device::ProcessToken) -> String {
-    process
-        .executable_url
-        .as_ref()
-        .and_then(|url| url.relative.rsplit('/').next())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Unknown Process")
-        .to_string()
-}
-
-fn has_get_task_allow(value: &plist::Value) -> bool {
-    value
-        .as_dictionary()
-        .and_then(|dictionary| dictionary.get("Entitlements"))
-        .and_then(|entitlements| entitlements.as_dictionary())
-        .and_then(|entitlements| entitlements.get("get-task-allow"))
-        .and_then(|flag| flag.as_boolean())
-        .unwrap_or(false)
+    Ok(targets::running_processes(processes))
 }
 
 async fn launch_app(udid: &str, bundle_id: &str, start_suspended: bool) -> Result<u32> {
@@ -914,11 +769,9 @@ async fn launch_app(udid: &str, bundle_id: &str, start_suspended: bool) -> Resul
     let mut app_service = AppServiceClient::connect_rsd(&mut adapter, &mut handshake)
         .await
         .context("launch: connect to com.apple.coredevice.appservice")?;
-    let response = app_service
-        .launch_application(bundle_id, &[], true, start_suspended, None, None, None)
+    launch_application(&mut app_service, bundle_id, start_suspended)
         .await
-        .with_context(|| format!("launch: launch application {bundle_id}"))?;
-    Ok(response.pid)
+        .with_context(|| format!("launch: launch application {bundle_id}"))
 }
 
 async fn attach_debugger(udid: &str, pid: u32) -> Result<ActiveDebugSession> {
@@ -942,6 +795,12 @@ async fn attach_debugger(udid: &str, pid: u32) -> Result<ActiveDebugSession> {
     })
 }
 
+async fn attach_and_detach(session: &ActiveDebugSession) -> Result<(String, String)> {
+    let attach_response = send_debug_command(session, format!("vAttach;{:x}", session.pid)).await?;
+    let detach_response = send_debug_command(session, "D").await?;
+    Ok((attach_response, detach_response))
+}
+
 async fn send_debug_command(
     session: &ActiveDebugSession,
     command: impl Into<String>,
@@ -953,31 +812,6 @@ async fn send_debug_command(
         .await?
         .unwrap_or_default();
     Ok(response)
-}
-
-async fn configure_no_ack_mode(
-    debug_proxy: &mut DebugProxyClient<Box<dyn ReadWrite>>,
-) -> Result<()> {
-    // Peer implementations prime the proxy with two ACKs before asking
-    // debugserver to stop using the per-packet handshake.
-    debug_proxy.send_ack().await?;
-    debug_proxy.send_ack().await?;
-    debug_proxy
-        .send_command(DebugserverCommand::from("QStartNoAckMode"))
-        .await?
-        .unwrap_or_default();
-    debug_proxy.set_ack_mode(false);
-    Ok(())
-}
-
-async fn connect_rsd(provider: &UsbmuxdProvider) -> Result<(AdapterHandle, RsdHandshake)> {
-    let proxy = CoreDeviceProxy::connect(provider).await?;
-    let rsd_port = proxy.tunnel_info().server_rsd_port;
-    let adapter = proxy.create_software_tunnel()?;
-    let mut adapter = adapter.to_async_handle();
-    let stream = adapter.connect(rsd_port).await?;
-    let handshake = RsdHandshake::new(stream).await?;
-    Ok((adapter, handshake))
 }
 
 async fn provider_for_udid(udid: &str) -> Result<UsbmuxdProvider> {
@@ -1008,26 +842,6 @@ async fn provider_for_udid_with_connection(
             )
         })?;
     Ok(device.to_provider(UsbmuxdAddr::default(), LABEL))
-}
-
-pub fn prepare_memory_region_packets(start_addr: u64, region_size: u64) -> Vec<u8> {
-    const JIT_PAGE_SIZE: u64 = 16 * 1024;
-    if region_size == 0 {
-        return Vec::new();
-    }
-
-    let command_count = region_size.div_ceil(JIT_PAGE_SIZE) as usize;
-    let mut packets = Vec::with_capacity(command_count * 19);
-
-    for index in 0..command_count {
-        let address = start_addr + (index as u64 * JIT_PAGE_SIZE);
-        let body = format!("M{address:x},1:69");
-        let checksum = body.bytes().fold(0u8, |acc, byte| acc.wrapping_add(byte));
-        let packet = format!("${body}#{checksum:02x}");
-        packets.extend_from_slice(packet.as_bytes());
-    }
-
-    packets
 }
 
 fn format_error(error: anyhow::Error) -> String {

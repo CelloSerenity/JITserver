@@ -1,0 +1,92 @@
+name: Build JITserver Web
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - web/**
+      - Windows.ico
+      - scripts/*.js
+      - src/device_services.rs
+      - src/jit_memory.rs
+      - src/script_catalog.rs
+      - src/targets.rs
+      - src/ui.rs
+      - .github/workflows/pages.yml
+  pull_request:
+    paths:
+      - web/**
+      - Windows.ico
+      - scripts/*.js
+      - src/device_services.rs
+      - src/jit_memory.rs
+      - src/script_catalog.rs
+      - src/targets.rs
+      - src/ui.rs
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: --cfg=web_sys_unstable_apis
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: web
+      - name: Build browser application
+        env:
+          JITSERVER_TSS_PROXY_URL: ${{ vars.JITSERVER_TSS_PROXY_URL }}
+        run: |
+          cargo build --manifest-path web/Cargo.toml --locked --release --target wasm32-unknown-unknown
+          BINDGEN_VERSION="$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/"/, "", $3); print $3; exit }' web/Cargo.lock)"
+          cargo install wasm-bindgen-cli --version "$BINDGEN_VERSION" --locked
+          ASSETS="build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "web/dist/$ASSETS"
+          sed "s|\./app\.js|./$ASSETS/app.js|; s|\./style\.css|./$ASSETS/style.css|" web/index.html > web/dist/index.html
+          cp web/app.js web/style.css "web/dist/$ASSETS/"
+          cp Windows.ico web/dist/favicon.ico
+          wasm-bindgen --target web --out-dir "web/dist/$ASSETS/pkg" web/target/wasm32-unknown-unknown/release/jitserver_web.wasm
+      - uses: actions/upload-artifact@v7
+        with:
+          name: jitserver-web
+          path: web/dist
+      - uses: actions/upload-pages-artifact@v5
+        if: >-
+          github.event_name != 'pull_request' &&
+          github.ref_type == 'branch' &&
+          (github.event_name == 'workflow_dispatch' ||
+           github.ref_name == github.event.repository.default_branch ||
+           github.ref_name == 'web-jit-support')
+        with:
+          path: web/dist
+
+  deploy:
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref_type == 'branch' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.ref_name == github.event.repository.default_branch ||
+       github.ref_name == 'web-jit-support')
+    needs: build
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v5
+        id: deployment

@@ -2,3 +2,5 @@
 /DDI
 *.log
 .DS_Store
+/web/target
+/web/dist

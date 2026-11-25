@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JITserver Web</title>
+  <link rel="icon" href="./favicon.ico" sizes="any">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <p id="status" role="status">Loading JITserver…</p>
+  <canvas id="jitserver" aria-label="JITserver" hidden></canvas>
+  <aside id="compatibility-warning" hidden>
+    <p id="compatibility-message" role="alert"></p>
+    <button type="button">Dismiss</button>
+  </aside>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

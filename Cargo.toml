@@ -22,6 +22,7 @@ idevice = { version = "0.1.68", default-features = false, features = [
   "tunnel_tcp_stack",
   "usbmuxd",
 ] }
+percent-encoding = "2.3"
 plist = "1.9"
 rfd = "0.17"
 rquickjs = "0.12"
